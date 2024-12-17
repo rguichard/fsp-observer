@@ -1,0 +1,62 @@
+# templates
+ 
+.test_template: &test
+  stage: test
+  variables:
+    GIT_STRATEGY: none
+  image:
+    name: $CI_REGISTRY_IMAGE:$CI_COMMIT_BRANCH
+    entrypoint: [""]
+  only:
+    - branches
+
+.build_template:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  script:
+    - mkdir -p /kaniko/.docker
+    - echo "$CI_COMMIT_SHA" > COMMIT_HASH
+    - >
+      echo "{
+        \"auths\": {
+          \"$CI_REGISTRY\": {
+            \"username\": \"$CI_REGISTRY_USER\",
+            \"password\":\"$CI_REGISTRY_PASSWORD\"
+          }
+        }
+      }" > /kaniko/.docker/config.json
+    - >
+      /kaniko/executor --context $CI_PROJECT_DIR \
+        --dockerfile $CI_PROJECT_DIR/docker/remote/Dockerfile \
+        --destination $CI_REGISTRY_IMAGE:$TARGET_REF \
+        --cache=true \
+        --cache-ttl=120h
+
+stages:
+  - build
+  - test
+
+build_branches:
+  extends: .build_template
+  variables:
+    TARGET_REF: $CI_COMMIT_BRANCH
+  only:
+    - branches
+
+build_tags:
+  extends: .build_template
+  variables:
+    TARGET_REF: $CI_COMMIT_TAG
+  only:
+    - tags
+
+test_ruff:
+  <<: *test
+  script:
+    - cd /app
+    - pip install -r dev-requirements.txt
+    - python -m ruff check .
+    - python -m ruff format --check
+
