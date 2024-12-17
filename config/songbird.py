@@ -23,7 +23,7 @@ def get_config() -> Configuration:
         chain=("songbird", 19),
         rpc_ws_url=os.environ["RPC_WS_URL"],
         epoch=epoch,
-        discord_webhook=os.environ["DISCORD_WEBHOOK"]
+        discord_webhook=os.environ["DISCORD_WEBHOOK"],
     )
 
     return config
