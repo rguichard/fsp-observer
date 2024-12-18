@@ -1,7 +1,7 @@
 import asyncio
 
-from config.config import get_config
-from config.types import Configuration
+from configuration.config import get_config
+from configuration.types import Configuration
 from observer.observer import observer_loop
 
 

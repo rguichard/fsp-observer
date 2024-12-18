@@ -1,4 +1,3 @@
-
 from attrs import frozen
 from eth_typing import ChecksumAddress
 

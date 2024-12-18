@@ -7,7 +7,7 @@ from py_flare_common.fsp.epoch.timing.songbird import (
     voting_epoch_factory,
 )
 
-from .types import Configuration, Epoch
+from ..types import Configuration, Contracts, Epoch
 
 
 def get_config() -> Configuration:
@@ -21,6 +21,7 @@ def get_config() -> Configuration:
     config = Configuration(
         identity_address=os.environ["IDENTITY_ADDRESS"],
         chain=("songbird", 19),
+        contracts=Contracts.get_contracts(),
         rpc_ws_url=os.environ["RPC_WS_URL"],
         epoch=epoch,
         discord_webhook=os.environ["DISCORD_WEBHOOK"],
