@@ -32,6 +32,8 @@ found_events["FlareSystemsManager"] = []
 found_events["FlareSystemsCalculator"] = []
 found_events["VoterRegistry"] = []
 
+registered_voters: dict[str, dict] = {}
+
 
 def fill_protocol_message_relayed(args):
     event = ProtocolMessageRelayed(
@@ -109,6 +111,56 @@ def fill_random_acquisition_started(args):
     return event
 
 
+async def fill_voters_info(
+    config: Configuration, start_block: int, end_block: int
+) -> None:
+    # reads logs for given blocks for the informations about the voters
+    w = AsyncWeb3(
+        AsyncWeb3.WebSocketProvider(config.rpc_ws_url),
+        middleware=[ExtraDataToPOAMiddleware],
+    )
+    await w.provider.connect()
+    contracts = [
+        config.contracts.VoterRegistry,
+        config.contracts.FlareSystemsCalculator,
+    ]
+    event_signatures = {e.signature: e for c in contracts for e in c.events.values()}
+
+    block_logs = await w.eth.get_logs(
+        {
+            "address": [contract.address for contract in contracts],
+            "fromBlock": start_block,
+            "toBlock": end_block,
+        }
+    )
+    for log in block_logs:
+        sig = log["topics"][0]
+
+        if sig.hex() in event_signatures:
+            event = event_signatures[sig.hex()]
+            data = get_event_data(w.eth.codec, event.abi, log)
+            match event.name:
+                case "VoterRegistered":
+                    e = fill_voter_registered(data["args"])
+                    voter = e.voter
+                    if voter not in registered_voters:
+                        registered_voters[voter] = {}
+                    spa = e.signing_policy_address
+                    sa = e.submit_address
+                    ssa = e.submit_signatures_address
+                    registered_voters[voter]["signing_policy_address"] = spa
+                    registered_voters[voter]["submit_address"] = sa
+                    registered_voters[voter]["submit_signatures_address"] = ssa
+
+                case "VoterRegistrationInfo":
+                    e = fill_voter_registration_info(data["args"])
+                    voter = e.voter
+                    if voter not in registered_voters:
+                        registered_voters[voter] = {}
+                    da = e.delegation_address
+                    registered_voters[voter]["delegation_address"] = da
+
+
 async def observer_loop(config: Configuration) -> None:
     w = AsyncWeb3(
         AsyncWeb3.WebSocketProvider(config.rpc_ws_url),
@@ -121,17 +173,32 @@ async def observer_loop(config: Configuration) -> None:
     # w.eth.get_block will need to be called
     voting_round = config.epoch.voting_epoch_factory.now().next
 
-    # TODO: (nejc) addresses are wrong
+    # TODO: (nejc) this needs to check appropriate blocks, based on current epoch
+    # VoterRegistered: 78662702 - 10000, 78662702
+    # SigningPolicyInitialized, VotePowerBlockSelected
+    # and RandomAcquisitionStarted:
+    # 78660002, 78670002
+    # VoterRegistrationInfo: 78662702 - 1000, 78662702
+    await fill_voters_info(config, 78661702, 78662702)
+    ta = config.identity_address
+    if ta in registered_voters:
+        tsa = registered_voters[ta].get("submit_address", "unknown")
+        tssa = registered_voters[ta].get("submit_signatures_address", "unknown")
+    else:
+        tsa = "unknown"
+        tssa = "unknown"
+
     notify_discord(
         config,
         f"flare-observer initialized\n\n"
         f"chain: {config.chain[0]}\n"
-        f"submit address: {config.identity_address}\n"
-        f"submit signatures address: {config.identity_address}\n\n"
+        f"submit address: {tsa}\n"
+        f"submit signatures address: {tssa}\n\n"
         f"starting in voting round: {voting_round.id} "
         f"(current: {voting_round.previous.id})",
     )
 
+    # wait until next voting epoch
     while True:
         latest_block = await w.eth.block_number
         if block == latest_block:
@@ -147,62 +214,56 @@ async def observer_loop(config: Configuration) -> None:
         if vr == voting_round:
             break
 
+    contracts = [
+        config.contracts.Relay,
+        config.contracts.VoterRegistry,
+        config.contracts.FlareSystemsManager,
+        config.contracts.FlareSystemsCalculator,
+    ]
+    event_signatures = {e.signature: e for c in contracts for e in c.events.values()}
+    # start listener
     while True:
         latest_block = await w.eth.block_number
         if block == latest_block:
             time.sleep(2)
             continue
 
-        contracts = [
-            config.contracts.Relay,
-            config.contracts.VoterRegistry,
-            config.contracts.FlareSystemsManager,
-            config.contracts.FlareSystemsCalculator,
-        ]
-        for contract in contracts:
-            event_signatures = {e.signature: e for e in contract.events.values()}
+        block_logs = await w.eth.get_logs(
+            {
+                "address": [contract.address for contract in contracts],
+                "fromBlock": block,
+                "toBlock": latest_block,
+            }
+        )
 
-            block_logs = await w.eth.get_logs(
-                {
-                    "address": contract.address,
-                    "fromBlock": block,
-                    "toBlock": latest_block,
-                }
-            )
-            # VoterRegistered: 78662702 - 10000, 78662702
-            # SigningPolicyInitialized, VotePowerBlockSelected
-            # and RandomAcquisitionStarted:
-            # 78660002, 78670002
-            # VoterRegistrationInfo: 78662702 - 1000, 78662702
+        for log in block_logs:
+            sig = log["topics"][0]
 
-            for log in block_logs:
-                sig = log["topics"][0]
-
-                if sig.hex() in event_signatures:
-                    event = event_signatures[sig.hex()]
-                    data = get_event_data(w.eth.codec, event.abi, log)
-                    match event.name:
-                        case "ProtocolMessageRelayed":
-                            e = fill_protocol_message_relayed(data["args"])
-                            found_events["Relay"].append(e)
-                        case "SigningPolicyInitialized":
-                            e = fill_signing_policy_initialized(data["args"])
-                            found_events["Relay"].append(e)
-                        case "VoterRegistered":
-                            e = fill_voter_registered(data["args"])
-                            found_events["VoterRegistry"].append(e)
-                        case "VoterRemoved":
-                            e = fill_voter_removed(data["args"])
-                            found_events["VoterRegistry"].append(e)
-                        case "VoterRegistrationInfo":
-                            e = fill_voter_registration_info(data["args"])
-                            found_events["FlareSystemsCalculator"].append(e)
-                        case "VotePowerBlockSelected":
-                            e = fill_vote_power_block_selected(data["args"])
-                            found_events["FlareSystemsManager"].append(e)
-                        case "RandomAcquisitionStarted":
-                            e = fill_random_acquisition_started(data["args"])
-                            found_events["FlareSystemsManager"].append(e)
+            if sig.hex() in event_signatures:
+                event = event_signatures[sig.hex()]
+                data = get_event_data(w.eth.codec, event.abi, log)
+                match event.name:
+                    case "ProtocolMessageRelayed":
+                        e = fill_protocol_message_relayed(data["args"])
+                        found_events["Relay"].append(e)
+                    case "SigningPolicyInitialized":
+                        e = fill_signing_policy_initialized(data["args"])
+                        found_events["Relay"].append(e)
+                    case "VoterRegistered":
+                        e = fill_voter_registered(data["args"])
+                        found_events["VoterRegistry"].append(e)
+                    case "VoterRemoved":
+                        e = fill_voter_removed(data["args"])
+                        found_events["VoterRegistry"].append(e)
+                    case "VoterRegistrationInfo":
+                        e = fill_voter_registration_info(data["args"])
+                        found_events["FlareSystemsCalculator"].append(e)
+                    case "VotePowerBlockSelected":
+                        e = fill_vote_power_block_selected(data["args"])
+                        found_events["FlareSystemsManager"].append(e)
+                    case "RandomAcquisitionStarted":
+                        e = fill_random_acquisition_started(data["args"])
+                        found_events["FlareSystemsManager"].append(e)
 
         block = latest_block
         print(f"------ {block}-----------")

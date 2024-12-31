@@ -15,4 +15,4 @@ def get_config() -> Configuration:
         "['coston', 'songbird', 'coston2', 'flare']"
     )
 
-    return importlib.import_module(f".{network}", "configuration.configs").get_config()
+    return importlib.import_module(".general", "configuration.configs").get_config()
