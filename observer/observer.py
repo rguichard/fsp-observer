@@ -6,6 +6,7 @@ from web3._utils.events import get_event_data
 from web3.middleware import ExtraDataToPOAMiddleware
 
 from configuration.types import Configuration
+from observer.reward_epoch_manager import RewardEpochInfo, SigningPolicy
 from observer.types import (
     ProtocolMessageRelayed,
     RandomAcquisitionStarted,
@@ -31,8 +32,6 @@ found_events["Relay"] = []
 found_events["FlareSystemsManager"] = []
 found_events["FlareSystemsCalculator"] = []
 found_events["VoterRegistry"] = []
-
-registered_voters: dict[str, dict] = {}
 
 
 def fill_protocol_message_relayed(args):
@@ -111,7 +110,7 @@ def fill_random_acquisition_started(args):
     return event
 
 
-async def fill_voters_info(
+async def get_signing_policy_events(
     config: Configuration, start_block: int, end_block: int
 ) -> None:
     # reads logs for given blocks for the informations about the voters
@@ -123,6 +122,7 @@ async def fill_voters_info(
     contracts = [
         config.contracts.VoterRegistry,
         config.contracts.FlareSystemsCalculator,
+        config.contracts.Relay,
     ]
     event_signatures = {e.signature: e for c in contracts for e in c.events.values()}
 
@@ -133,6 +133,7 @@ async def fill_voters_info(
             "toBlock": end_block,
         }
     )
+
     for log in block_logs:
         sig = log["topics"][0]
 
@@ -142,23 +143,33 @@ async def fill_voters_info(
             match event.name:
                 case "VoterRegistered":
                     e = fill_voter_registered(data["args"])
-                    voter = e.voter
-                    if voter not in registered_voters:
-                        registered_voters[voter] = {}
-                    spa = e.signing_policy_address
-                    sa = e.submit_address
-                    ssa = e.submit_signatures_address
-                    registered_voters[voter]["signing_policy_address"] = spa
-                    registered_voters[voter]["submit_address"] = sa
-                    registered_voters[voter]["submit_signatures_address"] = ssa
+                    found_events["VoterRegistry"].append(e)
 
                 case "VoterRegistrationInfo":
                     e = fill_voter_registration_info(data["args"])
-                    voter = e.voter
-                    if voter not in registered_voters:
-                        registered_voters[voter] = {}
-                    da = e.delegation_address
-                    registered_voters[voter]["delegation_address"] = da
+                    found_events["FlareSystemsCalculator"].append(e)
+
+                case "SigningPolicyInitialized":
+                    e = fill_signing_policy_initialized(data["args"])
+                    found_events["Relay"].append(e)
+
+
+def build_signing_policy() -> SigningPolicy:
+    # for now this assumes the following events are in found_events
+    # - 1 SigningPolicyInitialized event
+    # - n VoterRegistered events
+    # - n VoterRegistrationInfo events
+
+    # create signing policy
+    signing_policy = SigningPolicy(found_events["Relay"][0])
+
+    # update voters info
+    for e in found_events["VoterRegistry"]:
+        signing_policy.update_voter_registered_event(e)
+    for e in found_events["FlareSystemsCalculator"]:
+        signing_policy.update_voter_registration_info_event(e)
+
+    return signing_policy
 
 
 async def observer_loop(config: Configuration) -> None:
@@ -168,52 +179,64 @@ async def observer_loop(config: Configuration) -> None:
     )
     await w.provider.connect()
 
-    block = await w.eth.block_number
-    # TODO:(matej) calculate voting round from block timestamp
-    # w.eth.get_block will need to be called
-    voting_round = config.epoch.voting_epoch_factory.now().next
+    # get current voting round and reward epoch
+    block = await w.eth.get_block("latest")
+    assert "timestamp" in block
+    assert "number" in block
+    voting_round = config.epoch.voting_epoch_factory.from_timestamp(block["timestamp"])
+    reward_epoch = config.epoch.reward_epoch_factory.from_timestamp(block["timestamp"])
 
-    # TODO: (nejc) this needs to check appropriate blocks, based on current epoch
-    # VoterRegistered: 78662702 - 10000, 78662702
-    # SigningPolicyInitialized, VotePowerBlockSelected
-    # and RandomAcquisitionStarted:
-    # 78660002, 78670002
-    # VoterRegistrationInfo: 78662702 - 1000, 78662702
-    await fill_voters_info(config, 78661702, 78662702)
-    ta = config.identity_address
-    if ta in registered_voters:
-        tsa = registered_voters[ta].get("submit_address", "unknown")
-        tssa = registered_voters[ta].get("submit_signatures_address", "unknown")
-    else:
-        tsa = "unknown"
-        tssa = "unknown"
+    # TODO: (nejc) do this properly
+    # voter registration period is 2h (= 80 voting rounds) before the reward epoch
+    # avg time = 1s
+    avg_time = 1
+    starting_timestamp = reward_epoch.start_s
+    lower_block_id = block["number"] - int(
+        (time.time() - (starting_timestamp - 2 * 3600)) / avg_time
+    )
+    end_block_id = block["number"] - int((time.time() - starting_timestamp) / avg_time)
 
+    # get informations for events that build the current signing policy
+    await get_signing_policy_events(config, lower_block_id, end_block_id)
+    signing_policy = build_signing_policy()
+
+    reward_epoch_info = RewardEpochInfo(reward_epoch.id, signing_policy)
+
+    print("Signing policy created for reward epoch", reward_epoch.id)
+    print("Reward Epoch object created", reward_epoch_info)
+
+    # set up target address from config
+    tia = w.to_checksum_address(config.identity_address)
+    tspa = signing_policy.signing_policy_addresses[tia]
+    target_voter = signing_policy.voters[tspa]
     notify_discord(
         config,
         f"flare-observer initialized\n\n"
         f"chain: {config.chain[0]}\n"
-        f"submit address: {tsa}\n"
-        f"submit signatures address: {tssa}\n\n"
-        f"starting in voting round: {voting_round.id} "
-        f"(current: {voting_round.previous.id})",
+        f"submit address: {target_voter.submit_address}\n"
+        f"submit signatures address: {target_voter.submit_signatures_address}\n\n"
+        f"starting in voting round: {voting_round.next.id} "
+        f"(current: {voting_round.id})",
     )
 
     # wait until next voting epoch
+    block_number = block["number"]
     while True:
         latest_block = await w.eth.block_number
-        if block == latest_block:
+        if block_number == latest_block:
             time.sleep(2)
             continue
 
-        block += 1
-        block_data = await w.eth.get_block(block)
+        block_number += 1
+        block_data = await w.eth.get_block(block_number)
 
         assert "timestamp" in block_data
 
         vr = config.epoch.voting_epoch_factory.from_timestamp(block_data["timestamp"])
-        if vr == voting_round:
+        if vr == voting_round.next:
             break
 
+    # set up contracts and events (from config)
     contracts = [
         config.contracts.Relay,
         config.contracts.VoterRegistry,
@@ -221,17 +244,20 @@ async def observer_loop(config: Configuration) -> None:
         config.contracts.FlareSystemsCalculator,
     ]
     event_signatures = {e.signature: e for c in contracts for e in c.events.values()}
+
     # start listener
+    print("Listener started from block number", block_number)
     while True:
         latest_block = await w.eth.block_number
-        if block == latest_block:
+        if block_number == latest_block:
             time.sleep(2)
             continue
 
+        print(f"----- Listening up to {latest_block} -----")
         block_logs = await w.eth.get_logs(
             {
                 "address": [contract.address for contract in contracts],
-                "fromBlock": block,
+                "fromBlock": block_number,
                 "toBlock": latest_block,
             }
         )
@@ -264,7 +290,6 @@ async def observer_loop(config: Configuration) -> None:
                     case "RandomAcquisitionStarted":
                         e = fill_random_acquisition_started(data["args"])
                         found_events["FlareSystemsManager"].append(e)
+                print(event.name, e)
 
-        block = latest_block
-        print(f"------ {block}-----------")
-        print(found_events)
+        block_number = latest_block
