@@ -1,8 +1,13 @@
+import time
+
 from attrs import define
 from eth_typing import ChecksumAddress
 
+from configuration.types import Configuration
 from observer.types import (
+    RandomAcquisitionStarted,
     SigningPolicyInitialized,
+    VotePowerBlockSelected,
     VoterRegistered,
     VoterRegistrationInfo,
     VoterRemoved,
@@ -18,14 +23,14 @@ class RegisteredVoter:
     delegation_address: ChecksumAddress
 
     def __init__(self, address: ChecksumAddress):
-        self.signing_policy_address = address
+        self.identity_address = address
 
     def voter_registered_event(self, e: VoterRegistered):
-        if e.signing_policy_address != self.signing_policy_address:
+        if e.voter != self.identity_address:
             return
-        self.identity_address = e.voter
         self.submit_address = e.submit_address
         self.submit_signatures_address = e.submit_signatures_address
+        self.signing_policy_address = e.signing_policy_address
 
     def voter_registration_info_event(self, e: VoterRegistrationInfo):
         if e.voter != self.identity_address:
@@ -37,46 +42,110 @@ class RegisteredVoter:
 class SigningPolicy:
     reward_epoch: int
     threshold: int
+    start_voting_round_id: int
 
-    signing_policy_addresses: dict[ChecksumAddress, ChecksumAddress]
+    # keys are identity addresses
     voters: dict[ChecksumAddress, RegisteredVoter]
     weights: dict[ChecksumAddress, int]
 
-    def __init__(self, e: SigningPolicyInitialized):
-        self.reward_epoch = e.reward_epoch_id
-        self.threshold = e.threshold
+    # signing_policy_address -> identity address
+    signing_policy_addresses: dict[ChecksumAddress, ChecksumAddress]
+
+    def __init__(self, reward_epoch_id: int):
+        self.reward_epoch = reward_epoch_id
         self.voters = {}
         self.weights = {}
         self.signing_policy_addresses = {}
 
+    def update_signing_policy_initialized_event(self, e: SigningPolicyInitialized):
+        self.threshold = e.threshold
+        self.start_voting_round_id = e.start_voting_round_id
+
         for i, voter in enumerate(e.voters):
-            self.voters[voter] = RegisteredVoter(voter)
-            self.weights[voter] = e.weights[i]
+            ia = self.signing_policy_addresses[voter]
+            self.weights[ia] = e.weights[i]
 
     def update_voter_registered_event(self, e: VoterRegistered):
         ia = e.voter
         spa = e.signing_policy_address
-        self.voters[spa].voter_registered_event(e)
-        self.signing_policy_addresses[ia] = spa
+
+        if ia not in self.voters:
+            self.voters[ia] = RegisteredVoter(e.voter)
+        self.voters[ia].voter_registered_event(e)
+
+        self.signing_policy_addresses[spa] = ia
 
     def update_voter_registration_info_event(self, e: VoterRegistrationInfo):
         ia = e.voter
-        spa = self.signing_policy_addresses[ia]
-        self.voters[spa].voter_registration_info_event(e)
+
+        if ia not in self.voters:
+            self.voters[ia] = RegisteredVoter(e.voter)
+        self.voters[ia].voter_registration_info_event(e)
 
     def update_voter_removed_event(self, e: VoterRemoved):
         ia = e.voter
-        spa = self.signing_policy_addresses[ia]
-        self.voters.pop(spa, None)
-        self.weights.pop(spa, None)
+        self.voters.pop(ia, None)
+        self.weights.pop(ia, None)
+
+    def voter_weight(self, identity_address: ChecksumAddress):
+        w = self.weights.get(identity_address, 0)
+        p = round(w / sum(self.weights.values()), 8)
+        return w, p
 
 
 @define
 class RewardEpochInfo:
     id: int
-    signing_policy: SigningPolicy
+
+    signing_policy: SigningPolicy | None
+    vote_power_block_selected: int | None
+    random_acquisition_started: bool
+
+    def __init__(self, id: int):
+        self.id = id
+        self.random_acquisition_started = False
+        self.vote_power_block_selected = None
+        self.signing_policy = None
+
+    def add_signing_policy(self, policy: SigningPolicy):
+        self.signing_policy = policy
+
+    def add_vote_power_block_selected_event(self, e: VotePowerBlockSelected):
+        self.vote_power_block_selected = e.vote_power_block
+
+    def add_random_acquisition_started_event(self, e: RandomAcquisitionStarted):
+        self.random_acquisition_started = True
+
+    def status(self, config: Configuration) -> str | None:
+        ts_now = int(time.time())
+        next_expected_ts = config.epoch.reward_epoch(self.id + 1).start_s
+
+        # current reads
+        ras = self.random_acquisition_started
+        vpbs = self.vote_power_block_selected
+        sp = self.signing_policy
+
+        if not ras:
+            return "collecting offers"
+
+        if ras and vpbs is None:
+            return "selecting snapshot"
+
+        if vpbs is not None and sp is None:
+            return "voter registration"
+
+        if sp is not None:
+            svrs = config.epoch.voting_epoch(sp.start_voting_round_id).start_s
+            if svrs > ts_now:
+                return "ready for start"
+
+            if svrs < ts_now and next_expected_ts > ts_now:
+                return "active"
+
+            if svrs < ts_now and next_expected_ts < ts_now:
+                return "extended"
 
 
 @define
 class RewardEpochManager:
-    id: int
+    reward_epochs: dict[int, RewardEpochInfo]

@@ -34,6 +34,50 @@ found_events["FlareSystemsCalculator"] = []
 found_events["VoterRegistry"] = []
 
 
+async def find_voter_registration_blocks(
+    config: Configuration, current_block_id: int, start_of_epoch_ts: int
+) -> tuple[int, int]:
+    w = AsyncWeb3(
+        AsyncWeb3.WebSocketProvider(config.rpc_ws_url),
+        middleware=[ExtraDataToPOAMiddleware],
+    )
+    await w.provider.connect()
+
+    # there are roughly 3600 blocks in an hour
+    avg_block_time = 3600 / 3600
+    current_ts = int(time.time())
+
+    # find timestamp that is more than 2h30min (=9000s) before start_of_epoch_ts
+    target_start_ts = start_of_epoch_ts - 9000
+    start_diff = current_ts - target_start_ts
+
+    start_block_id = current_block_id - int(start_diff / avg_block_time)
+    block = await w.eth.get_block(start_block_id)
+    assert "timestamp" in block
+    d = block["timestamp"] - target_start_ts
+    while abs(d) > 600:
+        start_block_id -= 100 * (d // abs(d))
+        block = await w.eth.get_block(start_block_id)
+        assert "timestamp" in block
+        d = block["timestamp"] - target_start_ts
+
+    # end timestamp is 1h (=3600s) before start_of_epoch_ts
+    target_end_ts = start_of_epoch_ts - 3600
+    end_diff = current_ts - target_end_ts
+    end_block_id = current_block_id - int(end_diff / avg_block_time)
+
+    block = await w.eth.get_block(end_block_id)
+    assert "timestamp" in block
+    d = block["timestamp"] - target_end_ts
+    while abs(d) > 600:
+        end_block_id -= 100 * (d // abs(d))
+        block = await w.eth.get_block(end_block_id)
+        assert "timestamp" in block
+        d = block["timestamp"] - target_end_ts
+
+    return (start_block_id, end_block_id)
+
+
 def fill_protocol_message_relayed(args):
     event = ProtocolMessageRelayed(
         protocol_id=int(args["protocolId"]),
@@ -111,7 +155,10 @@ def fill_random_acquisition_started(args):
 
 
 async def get_signing_policy_events(
-    config: Configuration, start_block: int, end_block: int
+    config: Configuration,
+    start_block: int,
+    end_block: int,
+    signing_policy: SigningPolicy,
 ) -> None:
     # reads logs for given blocks for the informations about the voters
     w = AsyncWeb3(
@@ -143,33 +190,19 @@ async def get_signing_policy_events(
             match event.name:
                 case "VoterRegistered":
                     e = fill_voter_registered(data["args"])
-                    found_events["VoterRegistry"].append(e)
+                    signing_policy.update_voter_registered_event(e)
+
+                case "VoterRemoved":
+                    e = fill_voter_removed(data["args"])
+                    signing_policy.update_voter_removed_event(e)
 
                 case "VoterRegistrationInfo":
                     e = fill_voter_registration_info(data["args"])
-                    found_events["FlareSystemsCalculator"].append(e)
+                    signing_policy.update_voter_registration_info_event(e)
 
                 case "SigningPolicyInitialized":
                     e = fill_signing_policy_initialized(data["args"])
-                    found_events["Relay"].append(e)
-
-
-def build_signing_policy() -> SigningPolicy:
-    # for now this assumes the following events are in found_events
-    # - 1 SigningPolicyInitialized event
-    # - n VoterRegistered events
-    # - n VoterRegistrationInfo events
-
-    # create signing policy
-    signing_policy = SigningPolicy(found_events["Relay"][0])
-
-    # update voters info
-    for e in found_events["VoterRegistry"]:
-        signing_policy.update_voter_registered_event(e)
-    for e in found_events["FlareSystemsCalculator"]:
-        signing_policy.update_voter_registration_info_event(e)
-
-    return signing_policy
+                    signing_policy.update_signing_policy_initialized_event(e)
 
 
 async def observer_loop(config: Configuration) -> None:
@@ -186,35 +219,43 @@ async def observer_loop(config: Configuration) -> None:
     voting_round = config.epoch.voting_epoch_factory.from_timestamp(block["timestamp"])
     reward_epoch = config.epoch.reward_epoch_factory.from_timestamp(block["timestamp"])
 
-    # TODO: (nejc) do this properly
-    # voter registration period is 2h (= 80 voting rounds) before the reward epoch
-    # avg time = 1s
-    avg_time = 1
-    starting_timestamp = reward_epoch.start_s
-    lower_block_id = block["number"] - int(
-        (time.time() - (starting_timestamp - 2 * 3600)) / avg_time
+    # voter registration period is 2h before the reward epoch and lasts 30min
+    # find block that has timestamp approx. 2h30min before the reward epoch
+    # and block that has timestamp approx. 1h before the reward epoch
+    lower_block_id, end_block_id = await find_voter_registration_blocks(
+        config, block["number"], reward_epoch.start_s
     )
-    end_block_id = block["number"] - int((time.time() - starting_timestamp) / avg_time)
+
+    # signing_policies
+    signing_policy = SigningPolicy(reward_epoch.id)
+    next_signing_policy = SigningPolicy(reward_epoch.id + 1)
 
     # get informations for events that build the current signing policy
-    await get_signing_policy_events(config, lower_block_id, end_block_id)
-    signing_policy = build_signing_policy()
+    await get_signing_policy_events(
+        config, lower_block_id, end_block_id, signing_policy
+    )
 
-    reward_epoch_info = RewardEpochInfo(reward_epoch.id, signing_policy)
+    reward_epoch_info = RewardEpochInfo(reward_epoch.id)
+    next_reward_epoch_info = RewardEpochInfo(reward_epoch.id + 1)
+
+    reward_epoch_info.add_signing_policy(signing_policy)
+    next_reward_epoch_info.add_signing_policy(next_signing_policy)
 
     print("Signing policy created for reward epoch", reward_epoch.id)
     print("Reward Epoch object created", reward_epoch_info)
+    # check reward epoch status
+    print("Reward Epoch status:", reward_epoch_info.status(config))
 
     # set up target address from config
     tia = w.to_checksum_address(config.identity_address)
-    tspa = signing_policy.signing_policy_addresses[tia]
-    target_voter = signing_policy.voters[tspa]
+    target_voter = signing_policy.voters[tia]
     notify_discord(
         config,
         f"flare-observer initialized\n\n"
         f"chain: {config.chain[0]}\n"
         f"submit address: {target_voter.submit_address}\n"
-        f"submit signatures address: {target_voter.submit_signatures_address}\n\n"
+        f"submit signatures address: {target_voter.submit_signatures_address}\n"
+        f"this address has voting power of: {signing_policy.voter_weight(tia)}\n\n"
         f"starting in voting round: {voting_round.next.id} "
         f"(current: {voting_round.id})",
     )
@@ -274,18 +315,23 @@ async def observer_loop(config: Configuration) -> None:
                         found_events["Relay"].append(e)
                     case "SigningPolicyInitialized":
                         e = fill_signing_policy_initialized(data["args"])
-                        found_events["Relay"].append(e)
+                        next_signing_policy.update_signing_policy_initialized_event(e)
+                        # found_events["Relay"].append(e)
                     case "VoterRegistered":
                         e = fill_voter_registered(data["args"])
-                        found_events["VoterRegistry"].append(e)
+                        next_signing_policy.update_voter_registered_event(e)
+                        # found_events["VoterRegistry"].append(e)
                     case "VoterRemoved":
                         e = fill_voter_removed(data["args"])
-                        found_events["VoterRegistry"].append(e)
+                        next_signing_policy.update_voter_removed_event(e)
+                        # found_events["VoterRegistry"].append(e)
                     case "VoterRegistrationInfo":
                         e = fill_voter_registration_info(data["args"])
-                        found_events["FlareSystemsCalculator"].append(e)
+                        next_signing_policy.update_voter_registration_info_event(e)
+                        # found_events["FlareSystemsCalculator"].append(e)
                     case "VotePowerBlockSelected":
                         e = fill_vote_power_block_selected(data["args"])
+
                         found_events["FlareSystemsManager"].append(e)
                     case "RandomAcquisitionStarted":
                         e = fill_random_acquisition_started(data["args"])
