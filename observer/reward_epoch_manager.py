@@ -43,26 +43,36 @@ class SigningPolicy:
     reward_epoch: int
     threshold: int
     start_voting_round_id: int
+    fully_set_up: bool
 
     # keys are identity addresses
     voters: dict[ChecksumAddress, RegisteredVoter]
     weights: dict[ChecksumAddress, int]
 
     # signing_policy_address -> identity address
-    signing_policy_addresses: dict[ChecksumAddress, ChecksumAddress]
+    spa_to_ia: dict[ChecksumAddress, ChecksumAddress]
 
     def __init__(self, reward_epoch_id: int):
         self.reward_epoch = reward_epoch_id
+        self.fully_set_up = False
         self.voters = {}
         self.weights = {}
-        self.signing_policy_addresses = {}
+        self.spa_to_ia = {}
 
     def update_signing_policy_initialized_event(self, e: SigningPolicyInitialized):
         self.threshold = e.threshold
         self.start_voting_round_id = e.start_voting_round_id
+        self.fully_set_up = True
 
+        # addresses in e.voters are signing policy addresses
         for i, voter in enumerate(e.voters):
-            ia = self.signing_policy_addresses[voter]
+            # as VoterRegisteredEvent and VoterRegistrationInfo always come in
+            # the same block, we only need to check if one (VRE) is missing
+            if voter not in self.spa_to_ia:
+                self.fully_set_up = False
+                break
+
+            ia = self.spa_to_ia[voter]
             self.weights[ia] = e.weights[i]
 
     def update_voter_registered_event(self, e: VoterRegistered):
@@ -73,7 +83,7 @@ class SigningPolicy:
             self.voters[ia] = RegisteredVoter(e.voter)
         self.voters[ia].voter_registered_event(e)
 
-        self.signing_policy_addresses[spa] = ia
+        self.spa_to_ia[spa] = ia
 
     def update_voter_registration_info_event(self, e: VoterRegistrationInfo):
         ia = e.voter
@@ -139,13 +149,17 @@ class RewardEpochInfo:
             if svrs > ts_now:
                 return "ready for start"
 
-            if svrs < ts_now and next_expected_ts > ts_now:
+            # here svrs < ts_now
+            if next_expected_ts > ts_now:
                 return "active"
 
-            if svrs < ts_now and next_expected_ts < ts_now:
+            if next_expected_ts < ts_now:
                 return "extended"
 
 
 @define
 class RewardEpochManager:
     reward_epochs: dict[int, RewardEpochInfo]
+
+    def __init__(self):
+        self.reward_epochs = {}

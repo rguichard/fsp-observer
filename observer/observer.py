@@ -6,7 +6,11 @@ from web3._utils.events import get_event_data
 from web3.middleware import ExtraDataToPOAMiddleware
 
 from configuration.types import Configuration
-from observer.reward_epoch_manager import RewardEpochInfo, SigningPolicy
+from observer.reward_epoch_manager import (
+    RewardEpochInfo,
+    RewardEpochManager,
+    SigningPolicy,
+)
 from observer.types import (
     ProtocolMessageRelayed,
     RandomAcquisitionStarted,
@@ -156,9 +160,11 @@ def fill_random_acquisition_started(args):
 
 async def get_signing_policy_events(
     config: Configuration,
+    reward_epoch_number: int,
     start_block: int,
     end_block: int,
     signing_policy: SigningPolicy,
+    reward_epoch_info_object: RewardEpochInfo,
 ) -> None:
     # reads logs for given blocks for the informations about the voters
     w = AsyncWeb3(
@@ -170,9 +176,9 @@ async def get_signing_policy_events(
         config.contracts.VoterRegistry,
         config.contracts.FlareSystemsCalculator,
         config.contracts.Relay,
+        config.contracts.FlareSystemsManager,
     ]
     event_signatures = {e.signature: e for c in contracts for e in c.events.values()}
-
     block_logs = await w.eth.get_logs(
         {
             "address": [contract.address for contract in contracts],
@@ -181,28 +187,84 @@ async def get_signing_policy_events(
         }
     )
 
+    # take note if the user (in config) registered as a voter
+    user_registered = False
+    user_registration_info = False
+
     for log in block_logs:
         sig = log["topics"][0]
 
         if sig.hex() in event_signatures:
             event = event_signatures[sig.hex()]
             data = get_event_data(w.eth.codec, event.abi, log)
+
+            # remove not used events (ProtocolMessageRelayed)
+            # and check for correct reward_epoch_id
+            if (
+                event.name == "ProtocolMessageRelayed"
+                or data["args"]["rewardEpochId"] != reward_epoch_number
+            ):
+                continue
+
+            ds = ""
             match event.name:
                 case "VoterRegistered":
                     e = fill_voter_registered(data["args"])
                     signing_policy.update_voter_registered_event(e)
 
+                    if e.voter == config.identity_address:
+                        ds = (
+                            "You registered as voter for reward epoch"
+                            f" {reward_epoch_number} with event:\n{e!s}"
+                        )
+                        user_registered = True
+
                 case "VoterRemoved":
                     e = fill_voter_removed(data["args"])
                     signing_policy.update_voter_removed_event(e)
+
+                    if e.voter == config.identity_address:
+                        ds = (
+                            "You were removed as a voter for reward epoch"
+                            f" {reward_epoch_number} with event:\n{e!s}"
+                        )
+                        user_registered = False
+                        user_registration_info = False
 
                 case "VoterRegistrationInfo":
                     e = fill_voter_registration_info(data["args"])
                     signing_policy.update_voter_registration_info_event(e)
 
+                    if e.voter == config.identity_address:
+                        ds = (
+                            "Your registration info for reward epoch"
+                            f" {reward_epoch_number} with event:\n{e!s}"
+                        )
+                        user_registration_info = True
+
                 case "SigningPolicyInitialized":
                     e = fill_signing_policy_initialized(data["args"])
                     signing_policy.update_signing_policy_initialized_event(e)
+
+                case "VotePowerBlockSelected":
+                    e = fill_vote_power_block_selected(data["args"])
+                    reward_epoch_info_object.add_vote_power_block_selected_event(e)
+
+                case "RandomAcquisitionStarted":
+                    e = fill_random_acquisition_started(data["args"])
+                    reward_epoch_info_object.add_random_acquisition_started_event(e)
+
+            if ds:
+                notify_discord(config, ds)
+
+    if not user_registered or not user_registration_info:
+        notify_discord(
+            config,
+            f"Your identity address {config.identity_address}\n"
+            f"is NOT REGISTERED for reward epoch {e.reward_epoch_id}.\n"
+            f"Did VoterRegisteredEvent happen? {user_registered}\n"
+            f"Did VoterRegistrationInfoEvent happen? {user_registration_info}",
+        )
 
 
 async def observer_loop(config: Configuration) -> None:
@@ -219,6 +281,29 @@ async def observer_loop(config: Configuration) -> None:
     voting_round = config.epoch.voting_epoch_factory.from_timestamp(block["timestamp"])
     reward_epoch = config.epoch.reward_epoch_factory.from_timestamp(block["timestamp"])
 
+    # create objects of RewardEpochManager and RewardEpochInfo classes
+    reward_epoch_manager = RewardEpochManager()
+
+    current_rid = reward_epoch.id
+    reward_epoch_info = RewardEpochInfo(current_rid)
+    next_reward_epoch_info = RewardEpochInfo(current_rid + 1)
+
+    reward_epoch_manager.reward_epochs[current_rid] = reward_epoch_info
+    reward_epoch_manager.reward_epochs[current_rid + 1] = next_reward_epoch_info
+    # current reward epoch changes, when the reward_epoch_factory in config clicks over
+    # at all times, we have at most 3 reward epochs in the manager
+
+    # also create objects of SigningPolicy class
+    signing_policy = SigningPolicy(current_rid)
+    next_signing_policy = SigningPolicy(current_rid + 1)
+
+    reward_epoch_info.add_signing_policy(signing_policy)
+    next_reward_epoch_info.add_signing_policy(next_signing_policy)
+
+    # ---------- all objects created --------------------
+
+    # we first fill signing policy for current reward epoch
+
     # voter registration period is 2h before the reward epoch and lasts 30min
     # find block that has timestamp approx. 2h30min before the reward epoch
     # and block that has timestamp approx. 1h before the reward epoch
@@ -226,25 +311,18 @@ async def observer_loop(config: Configuration) -> None:
         config, block["number"], reward_epoch.start_s
     )
 
-    # signing_policies
-    signing_policy = SigningPolicy(reward_epoch.id)
-    next_signing_policy = SigningPolicy(reward_epoch.id + 1)
-
     # get informations for events that build the current signing policy
     await get_signing_policy_events(
-        config, lower_block_id, end_block_id, signing_policy
+        config,
+        current_rid,
+        lower_block_id,
+        end_block_id,
+        signing_policy,
+        reward_epoch_info,
     )
-
-    reward_epoch_info = RewardEpochInfo(reward_epoch.id)
-    next_reward_epoch_info = RewardEpochInfo(reward_epoch.id + 1)
-
-    reward_epoch_info.add_signing_policy(signing_policy)
-    next_reward_epoch_info.add_signing_policy(next_signing_policy)
-
-    print("Signing policy created for reward epoch", reward_epoch.id)
+    print("Signing policy created for reward epoch", current_rid)
     print("Reward Epoch object created", reward_epoch_info)
-    # check reward epoch status
-    print("Reward Epoch status:", reward_epoch_info.status(config))
+    print("Current Reward Epoch status", reward_epoch_info.status(config))
 
     # set up target address from config
     tia = w.to_checksum_address(config.identity_address)
@@ -257,7 +335,8 @@ async def observer_loop(config: Configuration) -> None:
         f"submit signatures address: {target_voter.submit_signatures_address}\n"
         f"this address has voting power of: {signing_policy.voter_weight(tia)}\n\n"
         f"starting in voting round: {voting_round.next.id} "
-        f"(current: {voting_round.id})",
+        f"(current: {voting_round.id})\n"
+        f"current reward epoch: {current_rid}",
     )
 
     # wait until next voting epoch
@@ -278,6 +357,8 @@ async def observer_loop(config: Configuration) -> None:
             break
 
     # set up contracts and events (from config)
+    # TODO: (nejc) set this up with a function on class
+    # or contracts = attrs.asdict(config.contracts) <- this doesn't work
     contracts = [
         config.contracts.Relay,
         config.contracts.VoterRegistry,
@@ -289,17 +370,58 @@ async def observer_loop(config: Configuration) -> None:
     # start listener
     print("Listener started from block number", block_number)
     while True:
+        # check for new reward epoch
+        if config.epoch.reward_epoch_factory.now_id() != current_rid:
+            # switch current one
+            reward_epoch = reward_epoch.next
+            current_rid += 1
+            reward_epoch_info = next_reward_epoch_info
+            signing_policy = next_signing_policy
+
+            # if signing policy for new current reward epoch is not set up (fully)
+            # create a new one and fill it up by checking back
+            if (
+                not signing_policy.fully_set_up
+                or not reward_epoch_info.random_acquisition_started
+            ):
+                signing_policy = SigningPolicy(current_rid)
+                reward_epoch_info.add_signing_policy(signing_policy)
+
+                # fill it up
+                lower_block_id, end_block_id = await find_voter_registration_blocks(
+                    config, block_number, reward_epoch.start_s
+                )
+                await get_signing_policy_events(
+                    config,
+                    current_rid,
+                    lower_block_id,
+                    end_block_id,
+                    signing_policy,
+                    reward_epoch_info,
+                )
+
+            # create next one
+            next_reward_epoch_info = RewardEpochInfo(current_rid + 1)
+            reward_epoch_manager.reward_epochs[current_rid + 1] = next_reward_epoch_info
+            next_signing_policy = SigningPolicy(current_rid + 1)
+            next_reward_epoch_info.add_signing_policy(next_signing_policy)
+
+            # delete reward epoch number current_rid - 2
+            reward_epoch_manager.reward_epochs.pop(current_rid - 1, None)
+
+            print(f"Reward epoch number {current_rid} started.")
+
         latest_block = await w.eth.block_number
         if block_number == latest_block:
             time.sleep(2)
             continue
 
-        print(f"----- Listening up to {latest_block} -----")
+        print(f"----- Listening up to {latest_block - 1} -----")
         block_logs = await w.eth.get_logs(
             {
                 "address": [contract.address for contract in contracts],
                 "fromBlock": block_number,
-                "toBlock": latest_block,
+                "toBlock": latest_block - 1,
             }
         )
 
@@ -311,31 +433,34 @@ async def observer_loop(config: Configuration) -> None:
                 data = get_event_data(w.eth.codec, event.abi, log)
                 match event.name:
                     case "ProtocolMessageRelayed":
+                        # TODO: (nejc) set this one up
                         e = fill_protocol_message_relayed(data["args"])
                         found_events["Relay"].append(e)
+
                     case "SigningPolicyInitialized":
                         e = fill_signing_policy_initialized(data["args"])
                         next_signing_policy.update_signing_policy_initialized_event(e)
-                        # found_events["Relay"].append(e)
+
                     case "VoterRegistered":
                         e = fill_voter_registered(data["args"])
                         next_signing_policy.update_voter_registered_event(e)
-                        # found_events["VoterRegistry"].append(e)
+
                     case "VoterRemoved":
                         e = fill_voter_removed(data["args"])
                         next_signing_policy.update_voter_removed_event(e)
-                        # found_events["VoterRegistry"].append(e)
+
                     case "VoterRegistrationInfo":
                         e = fill_voter_registration_info(data["args"])
                         next_signing_policy.update_voter_registration_info_event(e)
-                        # found_events["FlareSystemsCalculator"].append(e)
+
                     case "VotePowerBlockSelected":
                         e = fill_vote_power_block_selected(data["args"])
+                        next_reward_epoch_info.add_vote_power_block_selected_event(e)
 
-                        found_events["FlareSystemsManager"].append(e)
                     case "RandomAcquisitionStarted":
                         e = fill_random_acquisition_started(data["args"])
-                        found_events["FlareSystemsManager"].append(e)
+                        next_reward_epoch_info.add_random_acquisition_started_event(e)
+
                 print(event.name, e)
 
         block_number = latest_block
