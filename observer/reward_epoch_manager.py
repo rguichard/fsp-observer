@@ -2,9 +2,18 @@ import time
 
 from attrs import define
 from eth_typing import ChecksumAddress
+from py_flare_common.fsp.messaging.types import (
+    FdcSubmit1,
+    FdcSubmit2,
+    FtsoSubmit1,
+    FtsoSubmit2,
+    ParsedPayload,
+    SubmitSignatures,
+)
 
 from configuration.types import Configuration
 from observer.types import (
+    ProtocolMessageRelayed,
     RandomAcquisitionStarted,
     SigningPolicyInitialized,
     VotePowerBlockSelected,
@@ -104,6 +113,41 @@ class SigningPolicy:
 
 
 @define
+class VotingEpochInfo:
+    id: int
+
+    # ftso
+    ftso_mr: tuple[int, str]
+    ftso_s1: dict[ChecksumAddress, ParsedPayload[FtsoSubmit1]]
+    ftso_s2: dict[ChecksumAddress, ParsedPayload[FtsoSubmit2]]
+    ftso_ss: dict[ChecksumAddress, ParsedPayload[SubmitSignatures]]
+
+    # fdc
+    fdc_mr: tuple[int, str]
+    fdc_s1: dict[ChecksumAddress, ParsedPayload[FdcSubmit1]]
+    fdc_s2: dict[ChecksumAddress, ParsedPayload[FdcSubmit2]]
+    fdc_ss: dict[ChecksumAddress, ParsedPayload[SubmitSignatures]]
+
+    def __init__(self, id: int):
+        self.id = id
+        self.ftso_mr = (0, "")
+        self.fdc_mr = (0, "")
+        self.ftso_s1 = {}
+        self.ftso_s2 = {}
+        self.ftso_ss = {}
+        self.fdc_s1 = {}
+        self.fdc_s2 = {}
+        self.fdc_ss = {}
+
+    def add_protocol_message_relayed_event(self, e: ProtocolMessageRelayed, ts: int):
+        match e.protocol_id:
+            case 100:
+                self.ftso_mr = ts, e.merkle_root
+            case 200:
+                self.fdc_mr = ts, e.merkle_root
+
+
+@define
 class RewardEpochInfo:
     id: int
 
@@ -158,8 +202,10 @@ class RewardEpochInfo:
 
 
 @define
-class RewardEpochManager:
+class EpochManager:
     reward_epochs: dict[int, RewardEpochInfo]
+    voting_epochs: dict[int, VotingEpochInfo]
 
     def __init__(self):
         self.reward_epochs = {}
+        self.voting_epochs = {}

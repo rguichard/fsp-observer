@@ -48,7 +48,7 @@ def event_signature(event_abi: ABIEvent) -> str:
 
 
 def function_signature(function_name: str) -> str:
-    return Web3.keccak(text=function_name).hex()[2:10]
+    return Web3.keccak(text=function_name).hex()[:8]
 
 
 @frozen
@@ -133,6 +133,7 @@ class Contracts:
     FlareSystemsCalculator: Contract
     FlareSystemsManager: Contract
     Relay: Contract
+    Submission: Contract
 
     @classmethod
     def get_contracts(cls) -> Self:

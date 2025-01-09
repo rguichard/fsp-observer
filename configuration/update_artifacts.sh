@@ -35,6 +35,7 @@ function copy_artifacts() {
         "Relay"
         "VoterRegistry"
         "FlareSystemsCalculator"
+        "Submission"
     )
 
 

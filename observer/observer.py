@@ -1,15 +1,25 @@
 import time
 
 import requests
+from py_flare_common.fsp.messaging import (
+    parse_generic_tx,
+    parse_submit1_tx,
+    parse_submit2_tx,
+    parse_submit_signature_tx,
+)
+from py_flare_common.fsp.messaging.byte_parser import ByteParser
+from py_flare_common.ftso.commit import commit_hash
 from web3 import AsyncWeb3
 from web3._utils.events import get_event_data
 from web3.middleware import ExtraDataToPOAMiddleware
+from web3.types import TxData
 
 from configuration.types import Configuration
 from observer.reward_epoch_manager import (
+    EpochManager,
     RewardEpochInfo,
-    RewardEpochManager,
     SigningPolicy,
+    VotingEpochInfo,
 )
 from observer.types import (
     ProtocolMessageRelayed,
@@ -29,13 +39,6 @@ def notify_discord(config: Configuration, message: str) -> None:
         headers={"Content-Type": "application/json"},
         json={"content": message},
     )
-
-
-found_events: dict[str, list] = {}
-found_events["Relay"] = []
-found_events["FlareSystemsManager"] = []
-found_events["FlareSystemsCalculator"] = []
-found_events["VoterRegistry"] = []
 
 
 async def find_voter_registration_blocks(
@@ -281,15 +284,17 @@ async def observer_loop(config: Configuration) -> None:
     voting_round = config.epoch.voting_epoch_factory.from_timestamp(block["timestamp"])
     reward_epoch = config.epoch.reward_epoch_factory.from_timestamp(block["timestamp"])
 
-    # create objects of RewardEpochManager and RewardEpochInfo classes
-    reward_epoch_manager = RewardEpochManager()
+    # create objects of EpochManager, RewardEpochInfo and VotingEpochInfo classes
+    epoch_manager = EpochManager()
 
     current_rid = reward_epoch.id
+    current_vr = voting_round.id
     reward_epoch_info = RewardEpochInfo(current_rid)
     next_reward_epoch_info = RewardEpochInfo(current_rid + 1)
 
-    reward_epoch_manager.reward_epochs[current_rid] = reward_epoch_info
-    reward_epoch_manager.reward_epochs[current_rid + 1] = next_reward_epoch_info
+    epoch_manager.reward_epochs[current_rid] = reward_epoch_info
+    epoch_manager.reward_epochs[current_rid + 1] = next_reward_epoch_info
+    epoch_manager.voting_epochs[current_vr] = VotingEpochInfo(current_vr)
     # current reward epoch changes, when the reward_epoch_factory in config clicks over
     # at all times, we have at most 3 reward epochs in the manager
 
@@ -370,6 +375,13 @@ async def observer_loop(config: Configuration) -> None:
     # start listener
     print("Listener started from block number", block_number)
     while True:
+        # check for new voting epoch
+        if config.epoch.voting_epoch_factory.now_id() != current_vr:
+            # switch current one
+            current_vr += 1
+            voting_round = voting_round.next
+            epoch_manager.voting_epochs[current_vr] = VotingEpochInfo(current_vr)
+
         # check for new reward epoch
         if config.epoch.reward_epoch_factory.now_id() != current_rid:
             # switch current one
@@ -402,12 +414,12 @@ async def observer_loop(config: Configuration) -> None:
 
             # create next one
             next_reward_epoch_info = RewardEpochInfo(current_rid + 1)
-            reward_epoch_manager.reward_epochs[current_rid + 1] = next_reward_epoch_info
+            epoch_manager.reward_epochs[current_rid + 1] = next_reward_epoch_info
             next_signing_policy = SigningPolicy(current_rid + 1)
             next_reward_epoch_info.add_signing_policy(next_signing_policy)
 
             # delete reward epoch number current_rid - 2
-            reward_epoch_manager.reward_epochs.pop(current_rid - 1, None)
+            epoch_manager.reward_epochs.pop(current_rid - 1, None)
 
             print(f"Reward epoch number {current_rid} started.")
 
@@ -417,6 +429,7 @@ async def observer_loop(config: Configuration) -> None:
             continue
 
         print(f"----- Listening up to {latest_block - 1} -----")
+        # check logs for events
         block_logs = await w.eth.get_logs(
             {
                 "address": [contract.address for contract in contracts],
@@ -424,7 +437,6 @@ async def observer_loop(config: Configuration) -> None:
                 "toBlock": latest_block - 1,
             }
         )
-
         for log in block_logs:
             sig = log["topics"][0]
 
@@ -433,9 +445,11 @@ async def observer_loop(config: Configuration) -> None:
                 data = get_event_data(w.eth.codec, event.abi, log)
                 match event.name:
                     case "ProtocolMessageRelayed":
-                        # TODO: (nejc) set this one up
                         e = fill_protocol_message_relayed(data["args"])
-                        found_events["Relay"].append(e)
+                        vei = epoch_manager.voting_epochs[e.voting_round_id]
+                        # timestamp of the event needs to be saved
+                        b = await w.eth.get_block(data["blockNumber"])
+                        vei.add_protocol_message_relayed_event(e, b["timestamp"])  # type: ignore
 
                     case "SigningPolicyInitialized":
                         e = fill_signing_policy_initialized(data["args"])
@@ -462,5 +476,140 @@ async def observer_loop(config: Configuration) -> None:
                         next_reward_epoch_info.add_random_acquisition_started_event(e)
 
                 print(event.name, e)
+
+        # check transactions for submit transactions
+        target_function_signatures = {
+            config.contracts.Submission.functions[
+                "submitSignatures"
+            ].signature: "submitSignatures",
+            config.contracts.Submission.functions["submit1"].signature: "submit1",
+            config.contracts.Submission.functions["submit2"].signature: "submit2",
+        }
+
+        for number in range(block_number, latest_block):
+            print("checking block number", number)
+            block_data = await w.eth.get_block(number, full_transactions=True)
+            assert "transactions" in block_data
+            assert "timestamp" in block_data
+            block_ts = block_data["timestamp"]
+
+            for tx in block_data["transactions"]:
+                assert type(tx) is TxData
+                assert "input" in tx
+                assert "from" in tx
+                called_function_sig = tx["input"].hex()[:8]
+                input = tx["input"].hex()[8:]
+                sender_address = tx["from"]
+
+                ds = ""
+                if called_function_sig in target_function_signatures:
+                    mode = target_function_signatures[called_function_sig]
+                    match mode:
+                        case "submit1":
+                            parsed = parse_submit1_tx(input)
+                            if parsed.ftso is not None:
+                                vei = epoch_manager.voting_epochs[
+                                    parsed.ftso.voting_round_id
+                                ]
+                                vei.ftso_s1[sender_address] = parsed.ftso
+                            if parsed.fdc is not None:
+                                vei = epoch_manager.voting_epochs[
+                                    parsed.fdc.voting_round_id
+                                ]
+                                vei.fdc_s1[sender_address] = parsed.fdc
+
+                            # 1.) check timestamp
+                            if block_ts > config.epoch.voting_epoch(vei.id).end_s:
+                                ds += "Submit 1 transaction is too late\n"
+
+                        case "submit2":
+                            parsed = parse_submit2_tx(input)
+                            if parsed.ftso is not None:
+                                vei = epoch_manager.voting_epochs[
+                                    parsed.ftso.voting_round_id
+                                ]
+                                vei.ftso_s2[sender_address] = parsed.ftso
+
+                            if parsed.fdc is not None:
+                                vei = epoch_manager.voting_epochs[
+                                    parsed.fdc.voting_round_id
+                                ]
+                                vei.fdc_s2[sender_address] = parsed.fdc
+
+                            # 1.) check timestamp
+                            if block_ts > config.epoch.voting_epoch(vei.id).end_s + 45:
+                                ds += "Submit 2 transaction is too late\n"
+
+                            if parsed.ftso is not None:
+                                # 2.) check correct sent value
+                                bp = ByteParser(parse_generic_tx(input).ftso.payload)
+                                rnd = bp.uint256()
+                                feed_v = bp.drain()
+                                hashed = commit_hash(
+                                    sender_address, vei.id, rnd, feed_v
+                                )
+
+                                # the only time this is false is at the start
+                                if sender_address in vei.ftso_s1:
+                                    s1_val = vei.ftso_s1[
+                                        sender_address
+                                    ].payload.commit_hash.hex()
+                                    if hashed != s1_val:
+                                        ds += (
+                                            "Submit 1 and Submit 2 values don't match\n"
+                                        )
+
+                                # 3.) check if any value is None
+                                nv = [
+                                    i
+                                    for i, v in enumerate(parsed.ftso.payload.values)
+                                    if v is None
+                                ]
+                                if nv:
+                                    ds += (
+                                        f"Submit 2 values have 'none' on indices {nv}\n"
+                                    )
+
+                        case "submitSignatures":
+                            parsed = parse_submit_signature_tx(input)
+                            if parsed.ftso is not None:
+                                vei = epoch_manager.voting_epochs[
+                                    parsed.ftso.voting_round_id
+                                ]
+                                vei.ftso_ss[sender_address] = parsed.ftso
+                                # 1.) check timestamp
+                                latest_ts = config.epoch.voting_epoch(vei.id).end_s + 55
+                                if vei.ftso_mr[1]:
+                                    latest_ts = max(latest_ts, vei.ftso_mr[0])
+                                if block_ts > latest_ts:
+                                    ds += "Submit Signatures ftso tx is too late\n"
+
+                                # 2.) check correct values sent
+                                # TODO: (nejc) set this up
+
+                            if parsed.fdc is not None:
+                                vei = epoch_manager.voting_epochs[
+                                    parsed.fdc.voting_round_id
+                                ]
+                                vei.fdc_ss[sender_address] = parsed.fdc
+                                # 1.) check timestamp
+                                latest_ts = config.epoch.voting_epoch(vei.id).end_s + 55
+                                if vei.fdc_mr[1]:
+                                    latest_ts = max(latest_ts, vei.fdc_mr[0])
+                                if block_ts > latest_ts:
+                                    ds += "Submit Signatures fdc tx is too late\n"
+
+                                # 2.) check correct values sent
+                                # TODO: (nejc) set this up
+
+                if (
+                    sender_address
+                    in [
+                        target_voter.submit_address,
+                        target_voter.submit_signatures_address,
+                    ]
+                    and ds
+                ):
+                    notify_discord(config, ds)
 
         block_number = latest_block
