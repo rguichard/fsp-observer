@@ -12,7 +12,6 @@ from py_flare_common.ftso.commit import commit_hash
 from web3 import AsyncWeb3
 from web3._utils.events import get_event_data
 from web3.middleware import ExtraDataToPOAMiddleware
-from web3.types import TxData
 
 from configuration.types import Configuration
 from observer.reward_epoch_manager import (
@@ -45,10 +44,9 @@ async def find_voter_registration_blocks(
     config: Configuration, current_block_id: int, start_of_epoch_ts: int
 ) -> tuple[int, int]:
     w = AsyncWeb3(
-        AsyncWeb3.WebSocketProvider(config.rpc_ws_url),
+        AsyncWeb3.AsyncHTTPProvider(config.rpc_url),
         middleware=[ExtraDataToPOAMiddleware],
     )
-    await w.provider.connect()
 
     # there are roughly 3600 blocks in an hour
     avg_block_time = 3600 / 3600
@@ -171,10 +169,10 @@ async def get_signing_policy_events(
 ) -> None:
     # reads logs for given blocks for the informations about the voters
     w = AsyncWeb3(
-        AsyncWeb3.WebSocketProvider(config.rpc_ws_url),
+        AsyncWeb3.AsyncHTTPProvider(config.rpc_url),
         middleware=[ExtraDataToPOAMiddleware],
     )
-    await w.provider.connect()
+
     contracts = [
         config.contracts.VoterRegistry,
         config.contracts.FlareSystemsCalculator,
@@ -272,10 +270,10 @@ async def get_signing_policy_events(
 
 async def observer_loop(config: Configuration) -> None:
     w = AsyncWeb3(
-        AsyncWeb3.WebSocketProvider(config.rpc_ws_url),
+        AsyncWeb3.AsyncHTTPProvider(config.rpc_url),
         middleware=[ExtraDataToPOAMiddleware],
     )
-    await w.provider.connect()
+    # await w.provider.connect()
 
     # get current voting round and reward epoch
     block = await w.eth.get_block("latest")
@@ -494,7 +492,7 @@ async def observer_loop(config: Configuration) -> None:
             block_ts = block_data["timestamp"]
 
             for tx in block_data["transactions"]:
-                assert type(tx) is TxData
+                assert not isinstance(tx, bytes)
                 assert "input" in tx
                 assert "from" in tx
                 called_function_sig = tx["input"].hex()[:8]

@@ -1,9 +1,9 @@
 import json
-import os
 from typing import Callable, Self
 
 from attrs import field, frozen
 from eth_typing import ABI, ABIEvent, ABIFunction, ChecksumAddress
+from eth_utils.address import to_checksum_address
 from py_flare_common.fsp.epoch.epoch import RewardEpoch, VotingEpoch
 from py_flare_common.fsp.epoch.factory import RewardEpochFactory, VotingEpochFactory
 from web3 import Web3
@@ -127,6 +127,18 @@ class Contract:
         object.__setattr__(self, "functions", functions)
 
 
+# NOTE:(matej) FlareContractRegistry smart contract always provides an up to date
+# mapper ({name:address}) for all official Flare contracts. It is deployed on all 4
+# chains on the SAME address and is guaranteed to never be redeployed. This is why we
+# can hardcode it here
+FLARE_CONTRACT_REGISTRY_ADDRESS = to_checksum_address(
+    "0xaD67FE66660Fb8dFE9d6b1b4240d8650e30F6019"
+)
+FLARE_CONTRACT_REGISTRY_ABI = json.load(
+    open("configuration/artifacts/FlareContractRegistry.json")
+)
+
+
 @frozen
 class Contracts:
     VoterRegistry: Contract
@@ -136,23 +148,27 @@ class Contracts:
     Submission: Contract
 
     @classmethod
-    def get_contracts(cls) -> Self:
+    def get_contracts(cls, w: Web3) -> Self:
         attr_names = [a.name for a in cls.__attrs_attrs__]  # type: ignore
-        with open(f"configuration/chain/{os.getenv('NETWORK')}/contracts.json") as f:
-            contracts = {c["name"]: c["address"] for c in json.load(f)}
 
-            kwargs = {}
+        registry = w.eth.contract(
+            address=FLARE_CONTRACT_REGISTRY_ADDRESS,
+            abi=FLARE_CONTRACT_REGISTRY_ABI,
+        )
 
-            for name in attr_names:
-                kwargs[name] = None
-                if name in contracts:
-                    kwargs[name] = Contract(
-                        name,
-                        contracts[name],
-                        f"configuration/chain/{os.getenv('NETWORK')}/artifacts/{name}.json",
-                    )
+        kwargs = {}
+        for name in attr_names:
+            address = to_checksum_address(
+                registry.functions.getContractAddressByName(name).call()
+            )
 
-            return cls(**kwargs)
+            kwargs[name] = Contract(
+                name,
+                address,
+                f"configuration/artifacts/{name}.json",
+            )
+
+        return cls(**kwargs)
 
 
 @frozen
@@ -165,9 +181,9 @@ class Epoch:
 
 @frozen
 class Configuration:
-    identity_address: str
-    chain: tuple[str, int]
+    identity_address: ChecksumAddress
+    chain: str
     contracts: Contracts
-    rpc_ws_url: str
+    rpc_url: str
     epoch: Epoch
-    discord_webhook: str
+    discord_webhook: str | None
