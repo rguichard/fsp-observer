@@ -29,10 +29,11 @@ from observer.types import (
     VoterRegistrationInfo,
     VoterRemoved,
 )
-from observer.utils import prefix_0x, un_prefix_0x
 
 
 def notify_discord(config: Configuration, message: str) -> None:
+    if config.discord_webhook is None:
+        return
     requests.post(
         config.discord_webhook,
         headers={"Content-Type": "application/json"},
@@ -81,82 +82,6 @@ async def find_voter_registration_blocks(
         d = block["timestamp"] - target_end_ts
 
     return (start_block_id, end_block_id)
-
-
-def fill_protocol_message_relayed(args):
-    event = ProtocolMessageRelayed(
-        protocol_id=int(args["protocolId"]),
-        voting_round_id=int(args["votingRoundId"]),
-        is_secure_random=args["isSecureRandom"],
-        merkle_root=prefix_0x(args["merkleRoot"].hex()),
-    )
-    return event
-
-
-def fill_signing_policy_initialized(args):
-    event = SigningPolicyInitialized(
-        reward_epoch_id=int(args["rewardEpochId"]),
-        start_voting_round_id=int(args["startVotingRoundId"]),
-        threshold=int(args["threshold"]),
-        seed=int(args["seed"]),
-        voters=args["voters"],
-        weights=[int(w) for w in args["weights"]],
-        signing_policy_bytes=args["signingPolicyBytes"],
-        timestamp=int(args["timestamp"]),
-    )
-    return event
-
-
-def fill_voter_registered(args):
-    event = VoterRegistered(
-        reward_epoch_id=int(args["rewardEpochId"]),
-        voter=args["voter"],
-        signing_policy_address=args["signingPolicyAddress"],
-        submit_address=args["submitAddress"],
-        submit_signatures_address=args["submitSignaturesAddress"],
-        public_key=un_prefix_0x(args["publicKeyPart1"].hex())
-        + un_prefix_0x(args["publicKeyPart2"].hex()),
-        registration_weight=int(args["registrationWeight"]),
-    )
-    return event
-
-
-def fill_voter_removed(args):
-    event = VoterRemoved(
-        reward_epoch_id=int(args["rewardEpochId"]),
-        voter=args["voter"],
-    )
-    return event
-
-
-def fill_voter_registration_info(args):
-    event = VoterRegistrationInfo(
-        reward_epoch_id=int(args["rewardEpochId"]),
-        voter=args["voter"],
-        delegation_address=args["delegationAddress"],
-        delegation_fee_bips=int(args["delegationFeeBIPS"]),
-        w_nat_weight=int(args["wNatWeight"]),
-        w_nat_capped_weight=int(args["wNatCappedWeight"]),
-        node_ids=[n.hex() for n in args["nodeIds"]],
-        node_weights=[int(w) for w in args["nodeWeights"]],
-    )
-    return event
-
-
-def fill_vote_power_block_selected(args):
-    event = VotePowerBlockSelected(
-        reward_epoch_id=int(args["rewardEpochId"]),
-        vote_power_block=int(args["votePowerBlock"]),
-        timestamp=int(args["timestamp"]),
-    )
-    return event
-
-
-def fill_random_acquisition_started(args):
-    event = RandomAcquisitionStarted(
-        reward_epoch_id=int(args["rewardEpochId"]), timestamp=int(args["timestamp"])
-    )
-    return event
 
 
 async def get_signing_policy_events(
@@ -210,7 +135,7 @@ async def get_signing_policy_events(
             ds = ""
             match event.name:
                 case "VoterRegistered":
-                    e = fill_voter_registered(data["args"])
+                    e = VoterRegistered.from_dict(data["args"])
                     signing_policy.update_voter_registered_event(e)
 
                     if e.voter == config.identity_address:
@@ -221,7 +146,7 @@ async def get_signing_policy_events(
                         user_registered = True
 
                 case "VoterRemoved":
-                    e = fill_voter_removed(data["args"])
+                    e = VoterRemoved.from_dict(data["args"])
                     signing_policy.update_voter_removed_event(e)
 
                     if e.voter == config.identity_address:
@@ -233,7 +158,7 @@ async def get_signing_policy_events(
                         user_registration_info = False
 
                 case "VoterRegistrationInfo":
-                    e = fill_voter_registration_info(data["args"])
+                    e = VoterRegistrationInfo.from_dict(data["args"])
                     signing_policy.update_voter_registration_info_event(e)
 
                     if e.voter == config.identity_address:
@@ -244,15 +169,15 @@ async def get_signing_policy_events(
                         user_registration_info = True
 
                 case "SigningPolicyInitialized":
-                    e = fill_signing_policy_initialized(data["args"])
+                    e = SigningPolicyInitialized.from_dict(data["args"])
                     signing_policy.update_signing_policy_initialized_event(e)
 
                 case "VotePowerBlockSelected":
-                    e = fill_vote_power_block_selected(data["args"])
+                    e = VotePowerBlockSelected.from_dict(data["args"])
                     reward_epoch_info_object.add_vote_power_block_selected_event(e)
 
                 case "RandomAcquisitionStarted":
-                    e = fill_random_acquisition_started(data["args"])
+                    e = RandomAcquisitionStarted.from_dict(data["args"])
                     reward_epoch_info_object.add_random_acquisition_started_event(e)
 
             if ds:
@@ -443,34 +368,34 @@ async def observer_loop(config: Configuration) -> None:
                 data = get_event_data(w.eth.codec, event.abi, log)
                 match event.name:
                     case "ProtocolMessageRelayed":
-                        e = fill_protocol_message_relayed(data["args"])
+                        e = ProtocolMessageRelayed.from_dict(data["args"])
                         vei = epoch_manager.voting_epochs[e.voting_round_id]
                         # timestamp of the event needs to be saved
                         b = await w.eth.get_block(data["blockNumber"])
                         vei.add_protocol_message_relayed_event(e, b["timestamp"])  # type: ignore
 
                     case "SigningPolicyInitialized":
-                        e = fill_signing_policy_initialized(data["args"])
+                        e = SigningPolicyInitialized.from_dict(data["args"])
                         next_signing_policy.update_signing_policy_initialized_event(e)
 
                     case "VoterRegistered":
-                        e = fill_voter_registered(data["args"])
+                        e = VoterRegistered.from_dict(data["args"])
                         next_signing_policy.update_voter_registered_event(e)
 
                     case "VoterRemoved":
-                        e = fill_voter_removed(data["args"])
+                        e = VoterRemoved.from_dict(data["args"])
                         next_signing_policy.update_voter_removed_event(e)
 
                     case "VoterRegistrationInfo":
-                        e = fill_voter_registration_info(data["args"])
+                        e = VoterRegistrationInfo.from_dict(data["args"])
                         next_signing_policy.update_voter_registration_info_event(e)
 
                     case "VotePowerBlockSelected":
-                        e = fill_vote_power_block_selected(data["args"])
+                        e = VotePowerBlockSelected.from_dict(data["args"])
                         next_reward_epoch_info.add_vote_power_block_selected_event(e)
 
                     case "RandomAcquisitionStarted":
-                        e = fill_random_acquisition_started(data["args"])
+                        e = RandomAcquisitionStarted.from_dict(data["args"])
                         next_reward_epoch_info.add_random_acquisition_started_event(e)
 
                 print(event.name, e)

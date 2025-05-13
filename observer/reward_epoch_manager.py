@@ -12,7 +12,8 @@ from py_flare_common.fsp.messaging.types import (
 )
 
 from configuration.types import Configuration
-from observer.types import (
+
+from .types import (
     ProtocolMessageRelayed,
     RandomAcquisitionStarted,
     SigningPolicyInitialized,
