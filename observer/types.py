@@ -2,6 +2,7 @@ from typing import Any, Self
 
 from attrs import frozen
 from eth_typing import ChecksumAddress
+from web3.types import BlockData
 
 from observer.utils import prefix_0x
 
@@ -12,14 +13,18 @@ class ProtocolMessageRelayed:
     voting_round_id: int
     is_secure_random: bool
     merkle_root: str
+    timestamp: int
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> Self:
+    def from_dict(cls, d: dict[str, Any], block_data: BlockData) -> Self:
+        assert "timestamp" in block_data
+
         return cls(
             protocol_id=int(d["protocolId"]),
             voting_round_id=int(d["votingRoundId"]),
             is_secure_random=d["isSecureRandom"],
             merkle_root=prefix_0x(d["merkleRoot"].hex()),
+            timestamp=block_data["timestamp"],
         )
 
 

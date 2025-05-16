@@ -1,6 +1,10 @@
+import enum
+import logging
 import time
 
 import requests
+from attrs import define
+from py_flare_common.fsp.epoch.epoch import RewardEpoch
 from py_flare_common.fsp.messaging import (
     parse_generic_tx,
     parse_submit1_tx,
@@ -8,6 +12,7 @@ from py_flare_common.fsp.messaging import (
     parse_submit_signature_tx,
 )
 from py_flare_common.fsp.messaging.byte_parser import ByteParser
+from py_flare_common.fsp.messaging.types import ParsedPayload
 from py_flare_common.ftso.commit import commit_hash
 from web3 import AsyncWeb3
 from web3._utils.events import get_event_data
@@ -15,10 +20,11 @@ from web3.middleware import ExtraDataToPOAMiddleware
 
 from configuration.types import Configuration
 from observer.reward_epoch_manager import (
-    EpochManager,
-    RewardEpochInfo,
+    Entity,
     SigningPolicy,
-    VotingEpochInfo,
+    VotingRound,
+    VotingRoundManager,
+    WTxData,
 )
 from observer.types import (
     ProtocolMessageRelayed,
@@ -29,6 +35,10 @@ from observer.types import (
     VoterRegistrationInfo,
     VoterRemoved,
 )
+
+LOGGER = logging.getLogger(__name__)
+logging.basicConfig(level="INFO")
+LOGGER.info("initialized")
 
 
 def notify_discord(config: Configuration, message: str) -> None:
@@ -42,19 +52,16 @@ def notify_discord(config: Configuration, message: str) -> None:
 
 
 async def find_voter_registration_blocks(
-    config: Configuration, current_block_id: int, start_of_epoch_ts: int
+    w: AsyncWeb3,
+    current_block_id: int,
+    reward_epoch: RewardEpoch,
 ) -> tuple[int, int]:
-    w = AsyncWeb3(
-        AsyncWeb3.AsyncHTTPProvider(config.rpc_url),
-        middleware=[ExtraDataToPOAMiddleware],
-    )
-
     # there are roughly 3600 blocks in an hour
     avg_block_time = 3600 / 3600
     current_ts = int(time.time())
 
     # find timestamp that is more than 2h30min (=9000s) before start_of_epoch_ts
-    target_start_ts = start_of_epoch_ts - 9000
+    target_start_ts = reward_epoch.start_s - 9000
     start_diff = current_ts - target_start_ts
 
     start_block_id = current_block_id - int(start_diff / avg_block_time)
@@ -68,7 +75,7 @@ async def find_voter_registration_blocks(
         d = block["timestamp"] - target_start_ts
 
     # end timestamp is 1h (=3600s) before start_of_epoch_ts
-    target_end_ts = start_of_epoch_ts - 3600
+    target_end_ts = reward_epoch.start_s - 3600
     end_diff = current_ts - target_end_ts
     end_block_id = current_block_id - int(end_diff / avg_block_time)
 
@@ -85,18 +92,15 @@ async def find_voter_registration_blocks(
 
 
 async def get_signing_policy_events(
+    w: AsyncWeb3,
     config: Configuration,
-    reward_epoch_number: int,
+    reward_epoch: RewardEpoch,
     start_block: int,
     end_block: int,
-    signing_policy: SigningPolicy,
-    reward_epoch_info_object: RewardEpochInfo,
-) -> None:
-    # reads logs for given blocks for the informations about the voters
-    w = AsyncWeb3(
-        AsyncWeb3.AsyncHTTPProvider(config.rpc_url),
-        middleware=[ExtraDataToPOAMiddleware],
-    )
+) -> SigningPolicy:
+    # reads logs for given blocks for the informations about the signing policy
+
+    builder = SigningPolicy.builder().for_epoch(reward_epoch)
 
     contracts = [
         config.contracts.VoterRegistry,
@@ -104,7 +108,25 @@ async def get_signing_policy_events(
         config.contracts.Relay,
         config.contracts.FlareSystemsManager,
     ]
-    event_signatures = {e.signature: e for c in contracts for e in c.events.values()}
+
+    event_names = {
+        # relay
+        "SigningPolicyInitialized",
+        # flare systems calculator
+        "VoterRegistrationInfo",
+        # flare systems manager
+        "RandomAcquisitionStarted",
+        "VotePowerBlockSelected",
+        "VoterRegistered",
+        "VoterRemoved",
+    }
+    event_signatures = {
+        e.signature: e
+        for c in contracts
+        for e in c.events.values()
+        if e.name in event_names
+    }
+
     block_logs = await w.eth.get_logs(
         {
             "address": [contract.address for contract in contracts],
@@ -113,84 +135,262 @@ async def get_signing_policy_events(
         }
     )
 
-    # take note if the user (in config) registered as a voter
-    user_registered = False
-    user_registration_info = False
-
     for log in block_logs:
         sig = log["topics"][0]
 
-        if sig.hex() in event_signatures:
-            event = event_signatures[sig.hex()]
-            data = get_event_data(w.eth.codec, event.abi, log)
+        if sig.hex() not in event_signatures:
+            continue
 
-            # remove not used events (ProtocolMessageRelayed)
-            # and check for correct reward_epoch_id
-            if (
-                event.name == "ProtocolMessageRelayed"
-                or data["args"]["rewardEpochId"] != reward_epoch_number
-            ):
-                continue
+        event = event_signatures[sig.hex()]
+        data = get_event_data(w.eth.codec, event.abi, log)
 
-            ds = ""
-            match event.name:
-                case "VoterRegistered":
-                    e = VoterRegistered.from_dict(data["args"])
-                    signing_policy.update_voter_registered_event(e)
+        match event.name:
+            case "VoterRegistered":
+                e = VoterRegistered.from_dict(data["args"])
+            case "VoterRemoved":
+                e = VoterRemoved.from_dict(data["args"])
+            case "VoterRegistrationInfo":
+                e = VoterRegistrationInfo.from_dict(data["args"])
+            case "SigningPolicyInitialized":
+                e = SigningPolicyInitialized.from_dict(data["args"])
+            case "VotePowerBlockSelected":
+                e = VotePowerBlockSelected.from_dict(data["args"])
+            case "RandomAcquisitionStarted":
+                e = RandomAcquisitionStarted.from_dict(data["args"])
+            case x:
+                raise ValueError(f"Unexpected event {x}")
 
-                    if e.voter == config.identity_address:
-                        ds = (
-                            "You registered as voter for reward epoch"
-                            f" {reward_epoch_number} with event:\n{e!s}"
-                        )
-                        user_registered = True
+        builder.add(e)
 
-                case "VoterRemoved":
-                    e = VoterRemoved.from_dict(data["args"])
-                    signing_policy.update_voter_removed_event(e)
+        # signing policy initialized is the last event that gets emitted
+        if event.name == "SigningPolicyInitialized":
+            break
 
-                    if e.voter == config.identity_address:
-                        ds = (
-                            "You were removed as a voter for reward epoch"
-                            f" {reward_epoch_number} with event:\n{e!s}"
-                        )
-                        user_registered = False
-                        user_registration_info = False
+    return builder.build()
 
-                case "VoterRegistrationInfo":
-                    e = VoterRegistrationInfo.from_dict(data["args"])
-                    signing_policy.update_voter_registration_info_event(e)
 
-                    if e.voter == config.identity_address:
-                        ds = (
-                            "Your registration info for reward epoch"
-                            f" {reward_epoch_number} with event:\n{e!s}"
-                        )
-                        user_registration_info = True
+class IssueLevel(enum.Enum):
+    DEBUG = 10
+    INFO = 20
 
-                case "SigningPolicyInitialized":
-                    e = SigningPolicyInitialized.from_dict(data["args"])
-                    signing_policy.update_signing_policy_initialized_event(e)
 
-                case "VotePowerBlockSelected":
-                    e = VotePowerBlockSelected.from_dict(data["args"])
-                    reward_epoch_info_object.add_vote_power_block_selected_event(e)
+@define
+class Issue:
+    level: IssueLevel
+    message: str
 
-                case "RandomAcquisitionStarted":
-                    e = RandomAcquisitionStarted.from_dict(data["args"])
-                    reward_epoch_info_object.add_random_acquisition_started_event(e)
 
-            if ds:
-                notify_discord(config, ds)
+def log_issue(config, issue: Issue):
+    LOGGER.log(issue.level.value, issue.message)
+    notify_discord(config, issue.level.name + " " + issue.message)
 
-    if not user_registered or not user_registration_info:
-        notify_discord(
-            config,
-            f"Your identity address {config.identity_address}\n"
-            f"is NOT REGISTERED for reward epoch {e.reward_epoch_id}.\n"
-            f"Did VoterRegisteredEvent happen? {user_registered}\n"
-            f"Did VoterRegistrationInfoEvent happen? {user_registration_info}",
+
+def extract[T](
+    payloads: list[tuple[ParsedPayload[T], WTxData]],
+    round: int,
+    time_range: range,
+) -> tuple[ParsedPayload[T], WTxData] | None:
+    if not payloads:
+        return
+
+    latest: tuple[ParsedPayload[T], WTxData] | None = None
+
+    for pl, wtx in payloads:
+        if pl.voting_round_id != round:
+            continue
+        if not (time_range.start <= wtx.timestamp < time_range.stop):
+            continue
+
+        if latest is None or wtx.timestamp > latest[1].timestamp:
+            latest = (pl, wtx)
+
+    return latest
+
+
+def validate_ftso(round: VotingRound, entity: Entity):
+    epoch = round.voting_epoch
+    ftso = round.ftso
+    finalization = ftso.finalization
+
+    _submit1 = ftso.submit_1.by_identity.get(entity.identity_address, [])
+    submit_1 = extract(_submit1, epoch.id, range(epoch.start_s, epoch.end_s))
+
+    _submit2 = ftso.submit_2.by_identity.get(entity.identity_address, [])
+    submit_2 = extract(
+        _submit2, epoch.id, range(epoch.next.start_s, epoch.next.reveal_deadline())
+    )
+
+    sig_deadline = max(
+        epoch.next.start_s + 55, (finalization and finalization.timestamp) or 0
+    )
+    _submit_sig = ftso.submit_signatures.by_identity.get(entity.identity_address, [])
+    submit_sig = extract(
+        _submit_sig,
+        epoch.id,
+        range(epoch.next.reveal_deadline(), sig_deadline),
+    )
+
+    # TODO:(matej) check for transactions that happened too late (or too early)
+
+    issues = []
+
+    s1 = submit_1 is not None
+    s2 = submit_2 is not None
+    ss = submit_sig is not None
+
+    if not s1:
+        issues.append(
+            Issue(
+                IssueLevel.INFO,
+                f"no submit1 transaction for ftso in round {round.voting_epoch.id}",
+            )
         )
+
+    if s1 and not s2:
+        issues.append(
+            Issue(
+                # TODO:(matej) change level to critical
+                IssueLevel.INFO,
+                (
+                    "no submit2 transaction for ftso in round"
+                    f"{epoch.id}, causing reveal offence"
+                ),
+            ),
+        )
+
+    if s2:
+        indices = [
+            str(i) for i, v in enumerate(submit_2[0].payload.values) if v is None
+        ]
+
+        if indices:
+            issues.append(
+                Issue(
+                    # TODO:(matej) change level to warning
+                    IssueLevel.INFO,
+                    (
+                        "submit 2 had 'None' value for feeds on indices "
+                        f"{', '.join(indices)} in round {round.voting_epoch.id}"
+                    ),
+                ),
+            )
+
+    if s1 and s2:
+        # TODO:(matej) should just build back from parsed message
+        bp = ByteParser(parse_generic_tx(submit_2[1].input).ftso.payload)  # type: ignore
+        rnd = bp.uint256()
+        feed_v = bp.drain()
+
+        hashed = commit_hash(entity.submit_address, epoch.id, rnd, feed_v)
+
+        if submit_1[0].payload.commit_hash.hex() != hashed:
+            issues.append(
+                Issue(
+                    # TODO:(matej) change level to critical
+                    IssueLevel.INFO,
+                    (
+                        "commit hash and reveal didn't match in round "
+                        f"{round.voting_epoch.id}, causing reveal offence"
+                    ),
+                ),
+            )
+
+    if not ss:
+        issues.append(
+            Issue(
+                # TODO:(matej) change level to warning
+                IssueLevel.INFO,
+                (
+                    "no submit signatures transaction for ftso in round "
+                    f"{round.voting_epoch.id}"
+                ),
+            ),
+        )
+
+    if finalization and ss:
+        # TODO:(matej) check for correct signature
+        ...
+
+    return issues
+
+
+def validate_fdc(round: VotingRound, entity: Entity):
+    epoch = round.voting_epoch
+    fdc = round.ftso
+    finalization = fdc.finalization
+
+    _submit1 = fdc.submit_1.by_identity.get(entity.identity_address, [])
+    submit_1 = extract(_submit1, epoch.id, range(epoch.start_s, epoch.end_s))
+
+    _submit2 = fdc.submit_2.by_identity.get(entity.identity_address, [])
+    submit_2 = extract(
+        _submit2, epoch.id, range(epoch.next.start_s, epoch.next.reveal_deadline())
+    )
+
+    sig_deadline = max(
+        epoch.next.start_s + 55, (finalization and finalization.timestamp) or 0
+    )
+    _submit_sig = fdc.submit_signatures.by_identity.get(entity.identity_address, [])
+    submit_sig = extract(
+        _submit_sig,
+        epoch.id,
+        range(epoch.next.reveal_deadline(), sig_deadline),
+    )
+
+    # TODO:(matej) check for transactions that happened too late (or too early)
+
+    issues = []
+
+    s1 = submit_1 is not None
+    s2 = submit_2 is not None
+    ss = submit_sig is not None
+
+    if not s1:
+        # NOTE:(matej) this is expected behaviour in fdc
+        pass
+
+    if not s2:
+        issues.append(
+            Issue(
+                IssueLevel.INFO,
+                f"no submit2 transaction for fdc in round {epoch.id}",
+            ),
+        )
+
+    if s2:
+        # TODO:(matej) analize request array and report unprovden errors
+        ...
+
+    if s2 and not ss:
+        # TODO:(matej) check if submit2 bitvote dominated consensus bitvote
+        issues.append(
+            Issue(
+                # TODO:(matej) change level to critical
+                IssueLevel.INFO,
+                (
+                    "no submit signatures transaction for fdc in round"
+                    f"{epoch.id}, causing reveal offence"
+                ),
+            ),
+        )
+
+    if not ss:
+        issues.append(
+            Issue(
+                # TODO:(matej) change level to critical
+                IssueLevel.INFO,
+                (
+                    "no submit signatures transaction for fdc in round "
+                    f"{round.voting_epoch.id}"
+                ),
+            ),
+        )
+
+    if finalization and ss:
+        # TODO:(matej) check for correct signature
+        ...
+
+    return issues
 
 
 async def observer_loop(config: Configuration) -> None:
@@ -198,37 +398,19 @@ async def observer_loop(config: Configuration) -> None:
         AsyncWeb3.AsyncHTTPProvider(config.rpc_url),
         middleware=[ExtraDataToPOAMiddleware],
     )
-    # await w.provider.connect()
+
+    # reasignments for quick access
+    ve = config.epoch.voting_epoch
+    # re = config.epoch.reward_epoch
+    vef = config.epoch.voting_epoch_factory
+    ref = config.epoch.reward_epoch_factory
 
     # get current voting round and reward epoch
     block = await w.eth.get_block("latest")
     assert "timestamp" in block
     assert "number" in block
-    voting_round = config.epoch.voting_epoch_factory.from_timestamp(block["timestamp"])
-    reward_epoch = config.epoch.reward_epoch_factory.from_timestamp(block["timestamp"])
-
-    # create objects of EpochManager, RewardEpochInfo and VotingEpochInfo classes
-    epoch_manager = EpochManager()
-
-    current_rid = reward_epoch.id
-    current_vr = voting_round.id
-    reward_epoch_info = RewardEpochInfo(current_rid)
-    next_reward_epoch_info = RewardEpochInfo(current_rid + 1)
-
-    epoch_manager.reward_epochs[current_rid] = reward_epoch_info
-    epoch_manager.reward_epochs[current_rid + 1] = next_reward_epoch_info
-    epoch_manager.voting_epochs[current_vr] = VotingEpochInfo(current_vr)
-    # current reward epoch changes, when the reward_epoch_factory in config clicks over
-    # at all times, we have at most 3 reward epochs in the manager
-
-    # also create objects of SigningPolicy class
-    signing_policy = SigningPolicy(current_rid)
-    next_signing_policy = SigningPolicy(current_rid + 1)
-
-    reward_epoch_info.add_signing_policy(signing_policy)
-    next_reward_epoch_info.add_signing_policy(next_signing_policy)
-
-    # ---------- all objects created --------------------
+    reward_epoch = ref.from_timestamp(block["timestamp"])
+    voting_epoch = vef.from_timestamp(block["timestamp"])
 
     # we first fill signing policy for current reward epoch
 
@@ -236,36 +418,37 @@ async def observer_loop(config: Configuration) -> None:
     # find block that has timestamp approx. 2h30min before the reward epoch
     # and block that has timestamp approx. 1h before the reward epoch
     lower_block_id, end_block_id = await find_voter_registration_blocks(
-        config, block["number"], reward_epoch.start_s
+        w, block["number"], reward_epoch
     )
 
     # get informations for events that build the current signing policy
-    await get_signing_policy_events(
+    signing_policy = await get_signing_policy_events(
+        w,
         config,
-        current_rid,
+        reward_epoch,
         lower_block_id,
         end_block_id,
-        signing_policy,
-        reward_epoch_info,
     )
-    print("Signing policy created for reward epoch", current_rid)
-    print("Reward Epoch object created", reward_epoch_info)
-    print("Current Reward Epoch status", reward_epoch_info.status(config))
+    spb = SigningPolicy.builder()
+
+    # print("Signing policy created for reward epoch", current_rid)
+    # print("Reward Epoch object created", reward_epoch_info)
+    # print("Current Reward Epoch status", reward_epoch_info.status(config))
 
     # set up target address from config
     tia = w.to_checksum_address(config.identity_address)
-    target_voter = signing_policy.voters[tia]
-    notify_discord(
-        config,
-        f"flare-observer initialized\n\n"
-        f"chain: {config.chain[0]}\n"
-        f"submit address: {target_voter.submit_address}\n"
-        f"submit signatures address: {target_voter.submit_signatures_address}\n"
-        f"this address has voting power of: {signing_policy.voter_weight(tia)}\n\n"
-        f"starting in voting round: {voting_round.next.id} "
-        f"(current: {voting_round.id})\n"
-        f"current reward epoch: {current_rid}",
-    )
+    # target_voter = signing_policy.entity_mapper.by_identity_address[tia]
+    # notify_discord(
+    #     config,
+    #     f"flare-observer initialized\n\n"
+    #     f"chain: {config.chain}\n"
+    #     f"submit address: {target_voter.submit_address}\n"
+    #     f"submit signatures address: {target_voter.submit_signatures_address}\n",
+    #     # f"this address has voting power of: {signing_policy.voter_weight(tia)}\n\n"
+    #     # f"starting in voting round: {voting_round.next.id} "
+    #     # f"(current: {voting_round.id})\n"
+    #     # f"current reward epoch: {current_rid}",
+    # )
 
     # wait until next voting epoch
     block_number = block["number"]
@@ -280,9 +463,12 @@ async def observer_loop(config: Configuration) -> None:
 
         assert "timestamp" in block_data
 
-        vr = config.epoch.voting_epoch_factory.from_timestamp(block_data["timestamp"])
-        if vr == voting_round.next:
+        _ve = vef.from_timestamp(block_data["timestamp"])
+        if _ve == voting_epoch.next:
+            voting_epoch = voting_epoch.next
             break
+
+    vrm = VotingRoundManager(voting_epoch.previous.id)
 
     # set up contracts and events (from config)
     # TODO: (nejc) set this up with a function on class
@@ -296,243 +482,155 @@ async def observer_loop(config: Configuration) -> None:
     event_signatures = {e.signature: e for c in contracts for e in c.events.values()}
 
     # start listener
-    print("Listener started from block number", block_number)
+    # print("Listener started from block number", block_number)
+    # check transactions for submit transactions
+    target_function_signatures = {
+        config.contracts.Submission.functions[
+            "submitSignatures"
+        ].signature: "submitSignatures",
+        config.contracts.Submission.functions["submit1"].signature: "submit1",
+        config.contracts.Submission.functions["submit2"].signature: "submit2",
+    }
+
     while True:
-        # check for new voting epoch
-        if config.epoch.voting_epoch_factory.now_id() != current_vr:
-            # switch current one
-            current_vr += 1
-            voting_round = voting_round.next
-            epoch_manager.voting_epochs[current_vr] = VotingEpochInfo(current_vr)
-
-        # check for new reward epoch
-        if config.epoch.reward_epoch_factory.now_id() != current_rid:
-            # switch current one
-            reward_epoch = reward_epoch.next
-            current_rid += 1
-            reward_epoch_info = next_reward_epoch_info
-            signing_policy = next_signing_policy
-
-            # if signing policy for new current reward epoch is not set up (fully)
-            # create a new one and fill it up by checking back
-            if (
-                not signing_policy.fully_set_up
-                or not reward_epoch_info.random_acquisition_started
-            ):
-                signing_policy = SigningPolicy(current_rid)
-                reward_epoch_info.add_signing_policy(signing_policy)
-
-                # fill it up
-                lower_block_id, end_block_id = await find_voter_registration_blocks(
-                    config, block_number, reward_epoch.start_s
-                )
-                await get_signing_policy_events(
-                    config,
-                    current_rid,
-                    lower_block_id,
-                    end_block_id,
-                    signing_policy,
-                    reward_epoch_info,
-                )
-
-            # create next one
-            next_reward_epoch_info = RewardEpochInfo(current_rid + 1)
-            epoch_manager.reward_epochs[current_rid + 1] = next_reward_epoch_info
-            next_signing_policy = SigningPolicy(current_rid + 1)
-            next_reward_epoch_info.add_signing_policy(next_signing_policy)
-
-            # delete reward epoch number current_rid - 2
-            epoch_manager.reward_epochs.pop(current_rid - 1, None)
-
-            print(f"Reward epoch number {current_rid} started.")
-
         latest_block = await w.eth.block_number
         if block_number == latest_block:
             time.sleep(2)
             continue
 
-        print(f"----- Listening up to {latest_block - 1} -----")
-        # check logs for events
-        block_logs = await w.eth.get_logs(
-            {
-                "address": [contract.address for contract in contracts],
-                "fromBlock": block_number,
-                "toBlock": latest_block - 1,
-            }
-        )
-        for log in block_logs:
-            sig = log["topics"][0]
-
-            if sig.hex() in event_signatures:
-                event = event_signatures[sig.hex()]
-                data = get_event_data(w.eth.codec, event.abi, log)
-                match event.name:
-                    case "ProtocolMessageRelayed":
-                        e = ProtocolMessageRelayed.from_dict(data["args"])
-                        vei = epoch_manager.voting_epochs[e.voting_round_id]
-                        # timestamp of the event needs to be saved
-                        b = await w.eth.get_block(data["blockNumber"])
-                        vei.add_protocol_message_relayed_event(e, b["timestamp"])  # type: ignore
-
-                    case "SigningPolicyInitialized":
-                        e = SigningPolicyInitialized.from_dict(data["args"])
-                        next_signing_policy.update_signing_policy_initialized_event(e)
-
-                    case "VoterRegistered":
-                        e = VoterRegistered.from_dict(data["args"])
-                        next_signing_policy.update_voter_registered_event(e)
-
-                    case "VoterRemoved":
-                        e = VoterRemoved.from_dict(data["args"])
-                        next_signing_policy.update_voter_removed_event(e)
-
-                    case "VoterRegistrationInfo":
-                        e = VoterRegistrationInfo.from_dict(data["args"])
-                        next_signing_policy.update_voter_registration_info_event(e)
-
-                    case "VotePowerBlockSelected":
-                        e = VotePowerBlockSelected.from_dict(data["args"])
-                        next_reward_epoch_info.add_vote_power_block_selected_event(e)
-
-                    case "RandomAcquisitionStarted":
-                        e = RandomAcquisitionStarted.from_dict(data["args"])
-                        next_reward_epoch_info.add_random_acquisition_started_event(e)
-
-                print(event.name, e)
-
-        # check transactions for submit transactions
-        target_function_signatures = {
-            config.contracts.Submission.functions[
-                "submitSignatures"
-            ].signature: "submitSignatures",
-            config.contracts.Submission.functions["submit1"].signature: "submit1",
-            config.contracts.Submission.functions["submit2"].signature: "submit2",
-        }
-
-        for number in range(block_number, latest_block):
-            print("checking block number", number)
-            block_data = await w.eth.get_block(number, full_transactions=True)
+        for block in range(block_number, latest_block):
+            LOGGER.debug(f"processing {block}")
+            block_data = await w.eth.get_block(block, full_transactions=True)
             assert "transactions" in block_data
             assert "timestamp" in block_data
             block_ts = block_data["timestamp"]
 
+            voting_epoch = vef.from_timestamp(block_ts)
+
+            if (
+                spb.signing_policy_initialized is not None
+                and spb.signing_policy_initialized.start_voting_round_id == voting_epoch
+            ):
+                # TODO:(matej) this could fail if the observer is started during
+                # last two hours of the reward epoch
+                signing_policy = spb.build()
+                spb = SigningPolicy.builder().for_epoch(
+                    signing_policy.reward_epoch.next
+                )
+
+            block_logs = await w.eth.get_logs(
+                {
+                    "address": [contract.address for contract in contracts],
+                    "fromBlock": block,
+                    "toBlock": block,
+                }
+            )
+
+            for log in block_logs:
+                sig = log["topics"][0]
+
+                if sig.hex() in event_signatures:
+                    event = event_signatures[sig.hex()]
+                    data = get_event_data(w.eth.codec, event.abi, log)
+                    match event.name:
+                        case "ProtocolMessageRelayed":
+                            e = ProtocolMessageRelayed.from_dict(
+                                data["args"], block_data
+                            )
+                            voting_round = vrm.get(ve(e.voting_round_id))
+                            if e.protocol_id == 100:
+                                voting_round.ftso.finalization = e
+                            if e.protocol_id == 200:
+                                voting_round.fdc.finalization = e
+
+                        case "SigningPolicyInitialized":
+                            e = SigningPolicyInitialized.from_dict(data["args"])
+                            spb.add(e)
+                        case "VoterRegistered":
+                            e = VoterRegistered.from_dict(data["args"])
+                            spb.add(e)
+                        case "VoterRemoved":
+                            e = VoterRemoved.from_dict(data["args"])
+                            spb.add(e)
+                        case "VoterRegistrationInfo":
+                            e = VoterRegistrationInfo.from_dict(data["args"])
+                            spb.add(e)
+                        case "VotePowerBlockSelected":
+                            e = VotePowerBlockSelected.from_dict(data["args"])
+                            spb.add(e)
+                        case "RandomAcquisitionStarted":
+                            e = RandomAcquisitionStarted.from_dict(data["args"])
+                            spb.add(e)
+
             for tx in block_data["transactions"]:
                 assert not isinstance(tx, bytes)
-                assert "input" in tx
-                assert "from" in tx
-                called_function_sig = tx["input"].hex()[:8]
-                input = tx["input"].hex()[8:]
-                sender_address = tx["from"]
+                wtx = WTxData.from_tx_data(tx, block_data)
 
-                ds = ""
+                called_function_sig = wtx.input[:4].hex()
+                input = wtx.input[4:].hex()
+                sender_address = wtx.from_address
+                entity = signing_policy.entity_mapper.by_omni.get(sender_address)
+                if entity is None:
+                    continue
+
                 if called_function_sig in target_function_signatures:
                     mode = target_function_signatures[called_function_sig]
                     match mode:
                         case "submit1":
-                            parsed = parse_submit1_tx(input)
-                            if parsed.ftso is not None:
-                                vei = epoch_manager.voting_epochs[
-                                    parsed.ftso.voting_round_id
-                                ]
-                                vei.ftso_s1[sender_address] = parsed.ftso
-                            if parsed.fdc is not None:
-                                vei = epoch_manager.voting_epochs[
-                                    parsed.fdc.voting_round_id
-                                ]
-                                vei.fdc_s1[sender_address] = parsed.fdc
-
-                            # 1.) check timestamp
-                            if block_ts > config.epoch.voting_epoch(vei.id).end_s:
-                                ds += "Submit 1 transaction is too late\n"
+                            try:
+                                parsed = parse_submit1_tx(input)
+                                if parsed.ftso is not None:
+                                    vrm.get(
+                                        ve(parsed.ftso.voting_round_id)
+                                    ).ftso.insert_submit_1(entity, parsed.ftso, wtx)
+                                if parsed.fdc is not None:
+                                    vrm.get(
+                                        ve(parsed.fdc.voting_round_id)
+                                    ).fdc.insert_submit_1(entity, parsed.fdc, wtx)
+                            except Exception:
+                                pass
 
                         case "submit2":
-                            parsed = parse_submit2_tx(input)
-                            if parsed.ftso is not None:
-                                vei = epoch_manager.voting_epochs[
-                                    parsed.ftso.voting_round_id
-                                ]
-                                vei.ftso_s2[sender_address] = parsed.ftso
-
-                            if parsed.fdc is not None:
-                                vei = epoch_manager.voting_epochs[
-                                    parsed.fdc.voting_round_id
-                                ]
-                                vei.fdc_s2[sender_address] = parsed.fdc
-
-                            # 1.) check timestamp
-                            if block_ts > config.epoch.voting_epoch(vei.id).end_s + 45:
-                                ds += "Submit 2 transaction is too late\n"
-
-                            if parsed.ftso is not None:
-                                # 2.) check correct sent value
-                                bp = ByteParser(parse_generic_tx(input).ftso.payload)
-                                rnd = bp.uint256()
-                                feed_v = bp.drain()
-                                hashed = commit_hash(
-                                    sender_address, vei.id, rnd, feed_v
-                                )
-
-                                # the only time this is false is at the start
-                                if sender_address in vei.ftso_s1:
-                                    s1_val = vei.ftso_s1[
-                                        sender_address
-                                    ].payload.commit_hash.hex()
-                                    if hashed != s1_val:
-                                        ds += (
-                                            "Submit 1 and Submit 2 values don't match\n"
-                                        )
-
-                                # 3.) check if any value is None
-                                nv = [
-                                    i
-                                    for i, v in enumerate(parsed.ftso.payload.values)
-                                    if v is None
-                                ]
-                                if nv:
-                                    ds += (
-                                        f"Submit 2 values have 'none' on indices {nv}\n"
-                                    )
+                            try:
+                                parsed = parse_submit2_tx(input)
+                                if parsed.ftso is not None:
+                                    vrm.get(
+                                        ve(parsed.ftso.voting_round_id)
+                                    ).ftso.insert_submit_2(entity, parsed.ftso, wtx)
+                                if parsed.fdc is not None:
+                                    vrm.get(
+                                        ve(parsed.fdc.voting_round_id)
+                                    ).fdc.insert_submit_2(entity, parsed.fdc, wtx)
+                            except Exception:
+                                pass
 
                         case "submitSignatures":
-                            parsed = parse_submit_signature_tx(input)
-                            if parsed.ftso is not None:
-                                vei = epoch_manager.voting_epochs[
-                                    parsed.ftso.voting_round_id
-                                ]
-                                vei.ftso_ss[sender_address] = parsed.ftso
-                                # 1.) check timestamp
-                                latest_ts = config.epoch.voting_epoch(vei.id).end_s + 55
-                                if vei.ftso_mr[1]:
-                                    latest_ts = max(latest_ts, vei.ftso_mr[0])
-                                if block_ts > latest_ts:
-                                    ds += "Submit Signatures ftso tx is too late\n"
+                            try:
+                                parsed = parse_submit_signature_tx(input)
+                                if parsed.ftso is not None:
+                                    vrm.get(
+                                        ve(parsed.ftso.voting_round_id)
+                                    ).ftso.insert_submit_signatures(
+                                        entity, parsed.ftso, wtx
+                                    )
+                                if parsed.fdc is not None:
+                                    vrm.get(
+                                        ve(parsed.fdc.voting_round_id)
+                                    ).fdc.insert_submit_signatures(
+                                        entity, parsed.fdc, wtx
+                                    )
+                            except Exception:
+                                pass
 
-                                # 2.) check correct values sent
-                                # TODO: (nejc) set this up
-
-                            if parsed.fdc is not None:
-                                vei = epoch_manager.voting_epochs[
-                                    parsed.fdc.voting_round_id
-                                ]
-                                vei.fdc_ss[sender_address] = parsed.fdc
-                                # 1.) check timestamp
-                                latest_ts = config.epoch.voting_epoch(vei.id).end_s + 55
-                                if vei.fdc_mr[1]:
-                                    latest_ts = max(latest_ts, vei.fdc_mr[0])
-                                if block_ts > latest_ts:
-                                    ds += "Submit Signatures fdc tx is too late\n"
-
-                                # 2.) check correct values sent
-                                # TODO: (nejc) set this up
-
-                if (
-                    sender_address
-                    in [
-                        target_voter.submit_address,
-                        target_voter.submit_signatures_address,
-                    ]
-                    and ds
+            rounds = vrm.finalize(block_data)
+            for r in rounds:
+                for i in validate_ftso(
+                    r, signing_policy.entity_mapper.by_identity_address[tia]
                 ):
-                    notify_discord(config, ds)
+                    log_issue(config, i)
+                for i in validate_fdc(
+                    r, signing_policy.entity_mapper.by_identity_address[tia]
+                ):
+                    log_issue(config, i)
 
         block_number = latest_block
