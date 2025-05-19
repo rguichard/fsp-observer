@@ -6,10 +6,24 @@
 
 deploy:
 
+currently we support push notification over:
+- discord webhook
+- slack webhook
+- telegram bot sendMessage method
+- generic url post
+
+All of these can be configured via env variables. All of these have `NOTIFICATION` and 
+aren't a required value for the observer to start. All example values below
+
 ```bash
 docker run \
     -e RPC_URL="http://host/ext/bc/C/rpc" \
     -e IDENTITY_ADDRESS="0x0000000000000000000000000000000000000000" \
+    -e NOTIFICATION_DISCORD_WEBHOOK="https://discord.com/api/webhooks/secret/secret" \
+    -e NOTIFICATION_TELEGRAM_BOT_TOKEN="secret" \
+    -e NOTIFICATION_TELEGRAM_CHAT_ID="secret" \
+    -e NOTIFICATION_SLACK_WEBHOOK="https://hooks.slack.com/services/secret/secret/secret" \
+    -e NOTIFICATION_GENERIC_WEBHOOK="http://host:port/path" \
     ghcr.io/flare-foundation/fsp-observer:main
 ```
 
@@ -46,7 +60,7 @@ todos:
     - notification plugins
         - [x] stdout logging
         - [x] discord
-        - [ ] slack
-        - [ ] telegram
+        - [x] slack
+        - [x] telegram
         - [ ] pager duty
-        - [ ] generic post
+        - [x] generic post

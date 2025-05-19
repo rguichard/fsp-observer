@@ -180,10 +180,39 @@ class Epoch:
 
 
 @frozen
+class NotificationDiscord:
+    webhook_url: str
+
+
+@frozen
+class NotificationSlack:
+    webhook_url: str
+
+
+@frozen
+class NotificationTelegram:
+    bot_token: str
+    chat_id: str
+
+
+@frozen
+class NotificationGeneric:
+    webhook_url: str
+
+
+@frozen
+class Notification:
+    discord: NotificationDiscord | None
+    slack: NotificationSlack | None
+    telegram: NotificationTelegram | None
+    generic: NotificationGeneric | None
+
+
+@frozen
 class Configuration:
     identity_address: ChecksumAddress
     chain_id: int
     contracts: Contracts
     rpc_url: str
     epoch: Epoch
-    discord_webhook: str | None
+    notification: Notification

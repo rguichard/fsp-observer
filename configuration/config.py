@@ -4,7 +4,16 @@ from eth_utils.address import to_checksum_address
 from py_flare_common.fsp.epoch.timing import coston, coston2, flare, songbird
 from web3 import Web3
 
-from .types import Configuration, Contracts, Epoch
+from .types import (
+    Configuration,
+    Contracts,
+    Epoch,
+    Notification,
+    NotificationDiscord,
+    NotificationGeneric,
+    NotificationSlack,
+    NotificationTelegram,
+)
 
 
 class ChainId:
@@ -57,6 +66,39 @@ def get_epoch(chain_id: int) -> Epoch:
     )
 
 
+def get_notification_config() -> Notification:
+    discord = None
+    discord_webhook = os.environ.get("NOTIFICATION_DISCORD_WEBHOOK")
+    if discord_webhook is not None:
+        discord = NotificationDiscord(discord_webhook)
+
+    slack = None
+    slack_webhook = os.environ.get("NOTIFICATION_SLACK_WEBHOOK")
+    if slack_webhook is not None:
+        slack = NotificationSlack(slack_webhook)
+
+    telegram = None
+    telegram_bot_token = os.environ.get("NOTIFICATION_TELEGRAM_BOT_TOKEN")
+    telegram_chat_id = os.environ.get("NOTIFICATION_TELEGRAM_CHAT_ID")
+    if telegram_bot_token is not None and telegram_chat_id is not None:
+        telegram = NotificationTelegram(
+            bot_token=telegram_bot_token,
+            chat_id=telegram_chat_id,
+        )
+
+    generic = None
+    generic_webhook = os.environ.get("NOTIFICATION_GENERIC_WEBHOOK")
+    if generic_webhook is not None:
+        generic = NotificationGeneric(generic_webhook)
+
+    return Notification(
+        discord=discord,
+        slack=slack,
+        telegram=telegram,
+        generic=generic,
+    )
+
+
 def get_config() -> Configuration:
     rpc_url = os.environ.get("RPC_URL")
 
@@ -81,7 +123,7 @@ def get_config() -> Configuration:
         chain_id=chain_id,
         contracts=Contracts.get_contracts(w),
         epoch=get_epoch(chain_id),
-        discord_webhook=os.environ.get("DISCORD_WEBHOOK"),
+        notification=get_notification_config(),
     )
 
     return config

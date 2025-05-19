@@ -25,7 +25,13 @@ from web3._utils.events import get_event_data
 from web3.middleware import ExtraDataToPOAMiddleware
 
 from configuration.config import ChainId
-from configuration.types import Configuration
+from configuration.types import (
+    Configuration,
+    NotificationDiscord,
+    NotificationGeneric,
+    NotificationSlack,
+    NotificationTelegram,
+)
 from observer.reward_epoch_manager import (
     Entity,
     SigningPolicy,
@@ -62,14 +68,35 @@ class Signature(EthSignature):
         )
 
 
-def notify_discord(config: Configuration, message: str) -> None:
-    if config.discord_webhook is None:
-        return
-
+def notify_discord(config: NotificationDiscord, message: str) -> None:
     requests.post(
-        config.discord_webhook,
+        config.webhook_url,
         headers={"Content-Type": "application/json"},
         json={"content": message},
+    )
+
+
+def notify_slack(config: NotificationSlack, message: str) -> None:
+    requests.post(
+        config.webhook_url,
+        headers={"Content-Type": "application/json"},
+        json={"text": message},
+    )
+
+
+def notify_telegram(config: NotificationTelegram, message: str) -> None:
+    requests.post(
+        f"https://api.telegram.org/bot{config.bot_token}/sendMessage",
+        headers={"Content-Type": "application/json"},
+        json={"chat_id": config.chat_id, "text": message},
+    )
+
+
+def notify_generic(config: NotificationGeneric, issue: "Issue") -> None:
+    requests.post(
+        config.webhook_url,
+        headers={"Content-Type": "application/json"},
+        json={"level": issue.level.value, "message": issue.message},
     )
 
 
@@ -259,9 +286,22 @@ class MessageBuilder:
         return self
 
 
-def log_issue(config, issue: Issue):
+def log_issue(config: Configuration, issue: Issue):
     LOGGER.log(issue.level.value, issue.message)
-    notify_discord(config, issue.level.name + " " + issue.message)
+
+    n = config.notification
+
+    if n.discord is not None:
+        notify_discord(n.discord, issue.level.name + " " + issue.message)
+
+    if n.slack is not None:
+        notify_slack(n.slack, issue.level.name + " " + issue.message)
+
+    if n.telegram is not None:
+        notify_telegram(n.telegram, issue.level.name + " " + issue.message)
+
+    if n.generic is not None:
+        notify_generic(n.generic, issue)
 
 
 def extract[T](
@@ -503,10 +543,10 @@ async def observer_loop(config: Configuration) -> None:
     #     Issue(
     #         IssueLevel.INFO,
     #         MessageBuilder()
-    #         .add_network(config.chain)
+    #         .add_network(config.chain_id)
     #         .add_protocol(100)
     #         .add_round(VotingEpoch(12, None))
-    #         .build_with_message("testing message"),
+    #         .build_with_message("testing message" + str(config.notification)),
     #     ),
     # )
     # return
