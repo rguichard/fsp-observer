@@ -182,7 +182,7 @@ class Epoch:
 @frozen
 class Configuration:
     identity_address: ChecksumAddress
-    chain: str
+    chain_id: int
     contracts: Contracts
     rpc_url: str
     epoch: Epoch

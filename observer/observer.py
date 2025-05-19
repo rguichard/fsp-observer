@@ -1,4 +1,6 @@
+import copy
 import enum
+import io
 import logging
 import time
 from typing import Self
@@ -7,7 +9,7 @@ import requests
 from attrs import define
 from eth_account._utils.signing import to_standard_v
 from eth_keys.datatypes import Signature as EthSignature
-from py_flare_common.fsp.epoch.epoch import RewardEpoch
+from py_flare_common.fsp.epoch.epoch import RewardEpoch, VotingEpoch
 from py_flare_common.fsp.messaging import (
     parse_generic_tx,
     parse_submit1_tx,
@@ -22,6 +24,7 @@ from web3 import AsyncWeb3
 from web3._utils.events import get_event_data
 from web3.middleware import ExtraDataToPOAMiddleware
 
+from configuration.config import ChainId
 from configuration.types import Configuration
 from observer.reward_epoch_manager import (
     Entity,
@@ -41,8 +44,10 @@ from observer.types import (
 )
 
 LOGGER = logging.getLogger(__name__)
-logging.basicConfig(level="INFO")
-LOGGER.info("initialized")
+logging.basicConfig(
+    format="%(asctime)s\t%(levelname)s\t%(name)s\t%(message)s",
+    level="INFO",
+)
 
 
 class Signature(EthSignature):
@@ -189,12 +194,69 @@ async def get_signing_policy_events(
 class IssueLevel(enum.Enum):
     DEBUG = 10
     INFO = 20
+    WARNING = 30
+    ERROR = 40
+    CRITICAL = 50
 
 
 @define
 class Issue:
     level: IssueLevel
     message: str
+
+
+@define
+class MessageBuilder:
+    network: int | None = None
+    round: VotingEpoch | None = None
+    protocol: int | None = None
+    message: str | None = None
+
+    def copy(self) -> Self:
+        return copy.copy(self)
+
+    def build(self) -> str:
+        assert self.message is not None
+
+        s = io.StringIO()
+
+        if self.network is not None:
+            network = ChainId.id_to_name(self.network)
+            s.write(f"network:{network} ")
+
+        if self.round is not None:
+            s.write(f"round:{self.round.id} ")
+
+        if self.protocol is not None:
+            # TODO:(matej) make an enum like class like ChainId
+            assert self.protocol in [100, 200]
+            protocol = "ftso" if self.protocol == 100 else "fdc"
+            s.write(f"protocol:{protocol} ")
+
+        s.write(self.message)
+
+        s.seek(0)
+        return s.read()
+
+    def build_with_message(self, m: str) -> str:
+        return self.copy().add_message(m).build()
+
+    def add_network(self, n: int) -> Self:
+        assert n in ChainId.all()
+        self.network = n
+        return self
+
+    def add_round(self, n: VotingEpoch) -> Self:
+        self.round = n
+        return self
+
+    def add_protocol(self, n: int) -> Self:
+        self.protocol = n
+        return self
+
+    def add_message(self, m: str) -> Self:
+        self.message = m
+        return self
 
 
 def log_issue(config, issue: Issue):
@@ -224,7 +286,14 @@ def extract[T](
     return latest
 
 
-def validate_ftso(round: VotingRound, entity: Entity):
+def validate_ftso(round: VotingRound, entity: Entity, config: Configuration):
+    mb = (
+        MessageBuilder()
+        .add_network(config.chain_id)
+        .add_round(round.voting_epoch)
+        .add_protocol(100)
+    )
+
     epoch = round.voting_epoch
     ftso = round.ftso
     finalization = ftso.finalization
@@ -259,19 +328,15 @@ def validate_ftso(round: VotingRound, entity: Entity):
         issues.append(
             Issue(
                 IssueLevel.INFO,
-                f"no submit1 transaction for ftso in round {epoch.id}",
+                mb.build_with_message("no submit1 transaction"),
             )
         )
 
     if s1 and not s2:
         issues.append(
             Issue(
-                # TODO:(matej) change level to critical
-                IssueLevel.INFO,
-                (
-                    "no submit2 transaction for ftso in round"
-                    f"{epoch.id}, causing reveal offence"
-                ),
+                IssueLevel.CRITICAL,
+                mb.build_with_message("no submit2 transaction, causing reveal offence"),
             ),
         )
 
@@ -283,13 +348,11 @@ def validate_ftso(round: VotingRound, entity: Entity):
         if indices:
             issues.append(
                 Issue(
-                    # TODO:(matej) change level to warning
-                    IssueLevel.INFO,
-                    (
-                        "submit 2 had 'None' value for feeds on indices "
-                        f"{', '.join(indices)} in round {epoch.id}"
+                    IssueLevel.WARNING,
+                    mb.build_with_message(
+                        f"submit 2 had 'None' on indices {', '.join(indices)}"
                     ),
-                ),
+                )
             )
 
     if s1 and s2:
@@ -303,11 +366,9 @@ def validate_ftso(round: VotingRound, entity: Entity):
         if submit_1[0].payload.commit_hash.hex() != hashed:
             issues.append(
                 Issue(
-                    # TODO:(matej) change level to critical
-                    IssueLevel.INFO,
-                    (
-                        "commit hash and reveal didn't match in round "
-                        f"{epoch.id}, causing reveal offence"
+                    IssueLevel.CRITICAL,
+                    mb.build_with_message(
+                        "commit hash and reveal didn't match, causing reveal offence"
                     ),
                 ),
             )
@@ -315,9 +376,8 @@ def validate_ftso(round: VotingRound, entity: Entity):
     if not ss:
         issues.append(
             Issue(
-                # TODO:(matej) change level to warning
-                IssueLevel.INFO,
-                ("no submit signatures transaction for ftso in round " f"{epoch.id}"),
+                IssueLevel.ERROR,
+                mb.build_with_message("no submit signatures transaction"),
             ),
         )
 
@@ -330,11 +390,9 @@ def validate_ftso(round: VotingRound, entity: Entity):
         if addr != entity.signing_policy_address:
             issues.append(
                 Issue(
-                    # TODO:(matej) change level to warning
-                    IssueLevel.INFO,
-                    (
-                        "submit signatures signature doesn't match finalization for "
-                        f"ftso in round {epoch.id}"
+                    IssueLevel.ERROR,
+                    mb.build_with_message(
+                        "submit signatures signature doesn't match finalization"
                     ),
                 ),
             )
@@ -342,7 +400,14 @@ def validate_ftso(round: VotingRound, entity: Entity):
     return issues
 
 
-def validate_fdc(round: VotingRound, entity: Entity):
+def validate_fdc(round: VotingRound, entity: Entity, config: Configuration):
+    mb = (
+        MessageBuilder()
+        .add_network(config.chain_id)
+        .add_round(round.voting_epoch)
+        .add_protocol(200)
+    )
+
     epoch = round.voting_epoch
     fdc = round.fdc
     finalization = fdc.finalization
@@ -380,34 +445,31 @@ def validate_fdc(round: VotingRound, entity: Entity):
     if not s2:
         issues.append(
             Issue(
-                IssueLevel.INFO,
-                f"no submit2 transaction for fdc in round {epoch.id}",
+                IssueLevel.ERROR,
+                mb.build_with_message("no submit2 transaction"),
             ),
         )
 
     if s2:
-        # TODO:(matej) analize request array and report unprovden errors
+        # TODO:(matej) analize request array and report unproven errors
         ...
 
     if s2 and not ss:
         # TODO:(matej) check if submit2 bitvote dominated consensus bitvote
         issues.append(
             Issue(
-                # TODO:(matej) change level to critical
-                IssueLevel.INFO,
-                (
-                    "no submit signatures transaction for fdc in round"
-                    f"{epoch.id}, causing reveal offence"
+                IssueLevel.CRITICAL,
+                mb.build_with_message(
+                    "no submit signatures transaction, causing reveal offence"
                 ),
             ),
         )
 
-    if not ss:
+    if not s2 and not ss:
         issues.append(
             Issue(
-                # TODO:(matej) change level to critical
-                IssueLevel.INFO,
-                ("no submit signatures transaction for fdc in round " f"{epoch.id}"),
+                IssueLevel.ERROR,
+                mb.build_with_message("no submit signatures transaction"),
             ),
         )
 
@@ -420,11 +482,9 @@ def validate_fdc(round: VotingRound, entity: Entity):
         if addr != entity.signing_policy_address:
             issues.append(
                 Issue(
-                    # TODO:(matej) change level to warning
-                    IssueLevel.INFO,
-                    (
-                        "submit signatures signature doesn't match finalization for "
-                        f"fdc in round {epoch.id}"
+                    IssueLevel.ERROR,
+                    mb.build_with_message(
+                        "submit signatures signature doesn't match finalization"
                     ),
                 ),
             )
@@ -437,6 +497,19 @@ async def observer_loop(config: Configuration) -> None:
         AsyncWeb3.AsyncHTTPProvider(config.rpc_url),
         middleware=[ExtraDataToPOAMiddleware],
     )
+
+    # log_issue(
+    #     config,
+    #     Issue(
+    #         IssueLevel.INFO,
+    #         MessageBuilder()
+    #         .add_network(config.chain)
+    #         .add_protocol(100)
+    #         .add_round(VotingEpoch(12, None))
+    #         .build_with_message("testing message"),
+    #     ),
+    # )
+    # return
 
     # reasignments for quick access
     ve = config.epoch.voting_epoch
@@ -476,6 +549,17 @@ async def observer_loop(config: Configuration) -> None:
 
     # set up target address from config
     tia = w.to_checksum_address(config.identity_address)
+    log_issue(
+        config,
+        Issue(
+            IssueLevel.INFO,
+            MessageBuilder()
+            .add_network(config.chain_id)
+            .build_with_message(
+                f"Initialized observer for identity_address={tia}",
+            ),
+        ),
+    )
     # target_voter = signing_policy.entity_mapper.by_identity_address[tia]
     # notify_discord(
     #     config,
@@ -664,11 +748,11 @@ async def observer_loop(config: Configuration) -> None:
             rounds = vrm.finalize(block_data)
             for r in rounds:
                 for i in validate_ftso(
-                    r, signing_policy.entity_mapper.by_identity_address[tia]
+                    r, signing_policy.entity_mapper.by_identity_address[tia], config
                 ):
                     log_issue(config, i)
                 for i in validate_fdc(
-                    r, signing_policy.entity_mapper.by_identity_address[tia]
+                    r, signing_policy.entity_mapper.by_identity_address[tia], config
                 ):
                     log_issue(config, i)
 

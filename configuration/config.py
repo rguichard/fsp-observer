@@ -78,7 +78,7 @@ def get_config() -> Configuration:
     config = Configuration(
         rpc_url=rpc_url,
         identity_address=to_checksum_address(identity_address),
-        chain=ChainId.id_to_name(chain_id),
+        chain_id=chain_id,
         contracts=Contracts.get_contracts(w),
         epoch=get_epoch(chain_id),
         discord_webhook=os.environ.get("DISCORD_WEBHOOK"),
