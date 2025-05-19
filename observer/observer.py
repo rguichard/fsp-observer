@@ -2,7 +2,6 @@ import logging
 import time
 from typing import Self
 
-import requests
 from eth_account._utils.signing import to_standard_v
 from eth_keys.datatypes import Signature as EthSignature
 from py_flare_common.fsp.epoch.epoch import RewardEpoch
@@ -22,10 +21,6 @@ from web3.middleware import ExtraDataToPOAMiddleware
 
 from configuration.types import (
     Configuration,
-    NotificationDiscord,
-    NotificationGeneric,
-    NotificationSlack,
-    NotificationTelegram,
 )
 from observer.reward_epoch_manager import (
     Entity,
@@ -45,6 +40,7 @@ from observer.types import (
 )
 
 from .message import Message, MessageLevel
+from .notification import notify_discord, notify_generic, notify_slack, notify_telegram
 
 LOGGER = logging.getLogger(__name__)
 logging.basicConfig(
@@ -63,38 +59,6 @@ class Signature(EthSignature):
                 int(s.s, 16),
             )
         )
-
-
-def notify_discord(config: NotificationDiscord, message: str) -> None:
-    requests.post(
-        config.webhook_url,
-        headers={"Content-Type": "application/json"},
-        json={"content": message},
-    )
-
-
-def notify_slack(config: NotificationSlack, message: str) -> None:
-    requests.post(
-        config.webhook_url,
-        headers={"Content-Type": "application/json"},
-        json={"text": message},
-    )
-
-
-def notify_telegram(config: NotificationTelegram, message: str) -> None:
-    requests.post(
-        f"https://api.telegram.org/bot{config.bot_token}/sendMessage",
-        headers={"Content-Type": "application/json"},
-        json={"chat_id": config.chat_id, "text": message},
-    )
-
-
-def notify_generic(config: NotificationGeneric, issue: "Message") -> None:
-    requests.post(
-        config.webhook_url,
-        headers={"Content-Type": "application/json"},
-        json={"level": issue.level.value, "message": issue.message},
-    )
 
 
 async def find_voter_registration_blocks(
