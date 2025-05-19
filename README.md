@@ -29,18 +29,24 @@ todos:
         - [ ] check node uptime
     - ftso:
         - [ ] better ftso value analysis 
+            - if you are meeting minimal conditions
             - weird value (not just None but also 0.1 all the time, or just wildly different to median)
             - parse events to be able to tell feeds by names not by indices
-        - [ ] check submit signatures signature against finalization 
+        - [x] check submit signatures signature against finalization 
     - fdc:
+        - [ ] sample minimal conditions
         - [ ] correct bitvote length (submit2 fdc)
-        - [ ] check submit signatures signature against finalization 
+        - [x] check submit signatures signature against finalization 
     - fast updates:
         - [ ] recover signature from fast updates and check if updates are being made 
         - [ ] check if length of update is correct
+        - [ ] sample minimal conditions
 - push notification scheme:
     - we need a general-ish extnesible framework to add more notification plugins
     - notification plugins
         - [x] stdout logging
         - [x] discord
         - [ ] slack
+        - [ ] telegram
+        - [ ] pager duty
+        - [ ] generic post

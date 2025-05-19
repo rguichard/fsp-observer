@@ -1,10 +1,10 @@
 from typing import Any, Self
 
 from attrs import frozen
+from eth_account.messages import _hash_eip191_message, encode_defunct
 from eth_typing import ChecksumAddress
+from eth_utils.crypto import keccak
 from web3.types import BlockData
-
-from observer.utils import prefix_0x
 
 
 @frozen
@@ -15,6 +15,16 @@ class ProtocolMessageRelayed:
     merkle_root: str
     timestamp: int
 
+    def to_message(self) -> bytes:
+        message = (
+            self.protocol_id.to_bytes(1, "big")
+            + self.voting_round_id.to_bytes(4, "big")
+            + self.is_secure_random.to_bytes(1, "big")
+            + bytes.fromhex(self.merkle_root)
+        )
+
+        return _hash_eip191_message(encode_defunct(keccak(message)))
+
     @classmethod
     def from_dict(cls, d: dict[str, Any], block_data: BlockData) -> Self:
         assert "timestamp" in block_data
@@ -23,7 +33,7 @@ class ProtocolMessageRelayed:
             protocol_id=int(d["protocolId"]),
             voting_round_id=int(d["votingRoundId"]),
             is_secure_random=d["isSecureRandom"],
-            merkle_root=prefix_0x(d["merkleRoot"].hex()),
+            merkle_root=d["merkleRoot"].hex(),
             timestamp=block_data["timestamp"],
         )
 

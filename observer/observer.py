@@ -1,9 +1,12 @@
 import enum
 import logging
 import time
+from typing import Self
 
 import requests
 from attrs import define
+from eth_account._utils.signing import to_standard_v
+from eth_keys.datatypes import Signature as EthSignature
 from py_flare_common.fsp.epoch.epoch import RewardEpoch
 from py_flare_common.fsp.messaging import (
     parse_generic_tx,
@@ -13,6 +16,7 @@ from py_flare_common.fsp.messaging import (
 )
 from py_flare_common.fsp.messaging.byte_parser import ByteParser
 from py_flare_common.fsp.messaging.types import ParsedPayload
+from py_flare_common.fsp.messaging.types import Signature as SSignature
 from py_flare_common.ftso.commit import commit_hash
 from web3 import AsyncWeb3
 from web3._utils.events import get_event_data
@@ -41,9 +45,22 @@ logging.basicConfig(level="INFO")
 LOGGER.info("initialized")
 
 
+class Signature(EthSignature):
+    @classmethod
+    def from_vrs(cls, s: SSignature) -> Self:
+        return cls(
+            vrs=(
+                to_standard_v(int(s.v, 16)),
+                int(s.r, 16),
+                int(s.s, 16),
+            )
+        )
+
+
 def notify_discord(config: Configuration, message: str) -> None:
     if config.discord_webhook is None:
         return
+
     requests.post(
         config.discord_webhook,
         headers={"Content-Type": "application/json"},
@@ -242,7 +259,7 @@ def validate_ftso(round: VotingRound, entity: Entity):
         issues.append(
             Issue(
                 IssueLevel.INFO,
-                f"no submit1 transaction for ftso in round {round.voting_epoch.id}",
+                f"no submit1 transaction for ftso in round {epoch.id}",
             )
         )
 
@@ -270,7 +287,7 @@ def validate_ftso(round: VotingRound, entity: Entity):
                     IssueLevel.INFO,
                     (
                         "submit 2 had 'None' value for feeds on indices "
-                        f"{', '.join(indices)} in round {round.voting_epoch.id}"
+                        f"{', '.join(indices)} in round {epoch.id}"
                     ),
                 ),
             )
@@ -290,7 +307,7 @@ def validate_ftso(round: VotingRound, entity: Entity):
                     IssueLevel.INFO,
                     (
                         "commit hash and reveal didn't match in round "
-                        f"{round.voting_epoch.id}, causing reveal offence"
+                        f"{epoch.id}, causing reveal offence"
                     ),
                 ),
             )
@@ -300,23 +317,34 @@ def validate_ftso(round: VotingRound, entity: Entity):
             Issue(
                 # TODO:(matej) change level to warning
                 IssueLevel.INFO,
-                (
-                    "no submit signatures transaction for ftso in round "
-                    f"{round.voting_epoch.id}"
-                ),
+                ("no submit signatures transaction for ftso in round " f"{epoch.id}"),
             ),
         )
 
     if finalization and ss:
-        # TODO:(matej) check for correct signature
-        ...
+        s = Signature.from_vrs(submit_sig[0].payload.signature)
+        addr = s.recover_public_key_from_msg_hash(
+            finalization.to_message()
+        ).to_checksum_address()
+
+        if addr != entity.signing_policy_address:
+            issues.append(
+                Issue(
+                    # TODO:(matej) change level to warning
+                    IssueLevel.INFO,
+                    (
+                        "submit signatures signature doesn't match finalization for "
+                        f"ftso in round {epoch.id}"
+                    ),
+                ),
+            )
 
     return issues
 
 
 def validate_fdc(round: VotingRound, entity: Entity):
     epoch = round.voting_epoch
-    fdc = round.ftso
+    fdc = round.fdc
     finalization = fdc.finalization
 
     _submit1 = fdc.submit_1.by_identity.get(entity.identity_address, [])
@@ -379,16 +407,27 @@ def validate_fdc(round: VotingRound, entity: Entity):
             Issue(
                 # TODO:(matej) change level to critical
                 IssueLevel.INFO,
-                (
-                    "no submit signatures transaction for fdc in round "
-                    f"{round.voting_epoch.id}"
-                ),
+                ("no submit signatures transaction for fdc in round " f"{epoch.id}"),
             ),
         )
 
     if finalization and ss:
-        # TODO:(matej) check for correct signature
-        ...
+        s = Signature.from_vrs(submit_sig[0].payload.signature)
+        addr = s.recover_public_key_from_msg_hash(
+            finalization.to_message()
+        ).to_checksum_address()
+
+        if addr != entity.signing_policy_address:
+            issues.append(
+                Issue(
+                    # TODO:(matej) change level to warning
+                    IssueLevel.INFO,
+                    (
+                        "submit signatures signature doesn't match finalization for "
+                        f"fdc in round {epoch.id}"
+                    ),
+                ),
+            )
 
     return issues
 
