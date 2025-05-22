@@ -41,6 +41,14 @@ from observer.types import (
 
 from .message import Message, MessageLevel
 from .notification import notify_discord, notify_generic, notify_slack, notify_telegram
+from .metrics import (
+    init_metrics, update_entity_metrics, record_message,
+    record_ftso_submit1, record_ftso_submit2, record_ftso_submit_signatures,
+    record_ftso_reveal_offence, record_ftso_none_value, record_ftso_signature_mismatch,
+    record_fdc_submit1, record_fdc_submit2, record_fdc_submit_signatures,
+    record_fdc_reveal_offence, record_fdc_signature_mismatch,
+    observer_info, reward_epoch_info, voting_epoch_info
+)
 
 LOGGER = logging.getLogger(__name__)
 logging.basicConfig(
@@ -195,6 +203,9 @@ def log_issue(config: Configuration, issue: Message):
 
     if n.generic is not None:
         notify_generic(n.generic, issue)
+        
+    # Record in metrics
+    record_message(issue, config.identity_address)
 
 
 def extract[T](
@@ -255,6 +266,14 @@ def validate_ftso(round: VotingRound, entity: Entity, config: Configuration):
     s1 = submit_1 is not None
     s2 = submit_2 is not None
     ss = submit_sig is not None
+    
+    # Record metrics for transaction presence
+    if s1:
+        record_ftso_submit1(entity.identity_address)
+    if s2:
+        record_ftso_submit2(entity.identity_address)
+    if ss:
+        record_ftso_submit_signatures(entity.identity_address)
 
     if not s1:
         issues.append(mb.build(MessageLevel.INFO, "no submit1 transaction"))
@@ -265,6 +284,7 @@ def validate_ftso(round: VotingRound, entity: Entity, config: Configuration):
                 MessageLevel.CRITICAL, "no submit2 transaction, causing reveal offence"
             )
         )
+        record_ftso_reveal_offence(entity.identity_address)
 
     if s2:
         indices = [
@@ -278,6 +298,8 @@ def validate_ftso(round: VotingRound, entity: Entity, config: Configuration):
                     f"submit 2 had 'None' on indices {', '.join(indices)}",
                 )
             )
+            for index in indices:
+                record_ftso_none_value(entity.identity_address, index)
 
     if s1 and s2:
         # TODO:(matej) should just build back from parsed message
@@ -294,6 +316,7 @@ def validate_ftso(round: VotingRound, entity: Entity, config: Configuration):
                     "commit hash and reveal didn't match, causing reveal offence",
                 ),
             )
+            record_ftso_reveal_offence(entity.identity_address)
 
     if not ss:
         issues.append(
@@ -313,6 +336,7 @@ def validate_ftso(round: VotingRound, entity: Entity, config: Configuration):
                     "submit signatures signature doesn't match finalization",
                 ),
             )
+            record_ftso_signature_mismatch(entity.identity_address)
 
     return issues
 
@@ -359,6 +383,14 @@ def validate_fdc(round: VotingRound, entity: Entity, config: Configuration):
     s2 = submit_2 is not None
     ss = submit_sig is not None
     ssd = submit_sig_deadline is not None
+    
+    # Record metrics for transaction presence
+    if s1:
+        record_fdc_submit1(entity.identity_address)
+    if s2:
+        record_fdc_submit2(entity.identity_address)
+    if ss:
+        record_fdc_submit_signatures(entity.identity_address)
 
     if not s1:
         # NOTE:(matej) this is expected behaviour in fdc
@@ -379,6 +411,7 @@ def validate_fdc(round: VotingRound, entity: Entity, config: Configuration):
                 "no submit signatures transaction, causing reveal offence",
             )
         )
+        record_fdc_reveal_offence(entity.identity_address)
 
     if s2 and ssd and not ss:
         issues.append(
@@ -390,6 +423,7 @@ def validate_fdc(round: VotingRound, entity: Entity, config: Configuration):
                 ),
             )
         )
+        record_fdc_reveal_offence(entity.identity_address)
 
     if not s2 and not ss:
         issues.append(
@@ -409,11 +443,15 @@ def validate_fdc(round: VotingRound, entity: Entity, config: Configuration):
                     "submit signatures signature doesn't match finalization",
                 )
             )
+            record_fdc_signature_mismatch(entity.identity_address)
 
     return issues
 
 
 async def observer_loop(config: Configuration) -> None:
+    # Initialize Prometheus metrics server on port 8000
+    init_metrics()
+    
     w = AsyncWeb3(
         AsyncWeb3.AsyncHTTPProvider(config.rpc_url),
         middleware=[ExtraDataToPOAMiddleware],
@@ -444,6 +482,10 @@ async def observer_loop(config: Configuration) -> None:
     assert "number" in block
     reward_epoch = ref.from_timestamp(block["timestamp"])
     voting_epoch = vef.from_timestamp(block["timestamp"])
+    
+    # Set initial epoch metrics
+    reward_epoch_info.labels(reward_epoch_id=reward_epoch.id).set(1)
+    voting_epoch_info.labels(voting_epoch_id=voting_epoch.id).set(1)
 
     # we first fill signing policy for current reward epoch
 
@@ -470,6 +512,10 @@ async def observer_loop(config: Configuration) -> None:
 
     # set up target address from config
     tia = w.to_checksum_address(config.identity_address)
+    
+    # Set observer info metric
+    observer_info.labels(identity_address=tia, chain_id=config.chain_id).set(1)
+    
     log_issue(
         config,
         Message.builder()
@@ -479,6 +525,12 @@ async def observer_loop(config: Configuration) -> None:
             f"Initialized observer for identity_address={tia}",
         ),
     )
+    
+    # Update entity metrics if entity exists in signing policy
+    if tia in signing_policy.entity_mapper.by_identity_address:
+        entity = signing_policy.entity_mapper.by_identity_address[tia]
+        update_entity_metrics(entity)
+    
     # target_voter = signing_policy.entity_mapper.by_identity_address[tia]
     # notify_discord(
     #     config,
@@ -508,6 +560,8 @@ async def observer_loop(config: Configuration) -> None:
         _ve = vef.from_timestamp(block_data["timestamp"])
         if _ve == voting_epoch.next:
             voting_epoch = voting_epoch.next
+            # Update voting epoch metric
+            voting_epoch_info.labels(voting_epoch_id=voting_epoch.id).set(1)
             break
 
     vrm = VotingRoundManager(voting_epoch.previous.id)
@@ -548,6 +602,8 @@ async def observer_loop(config: Configuration) -> None:
             block_ts = block_data["timestamp"]
 
             voting_epoch = vef.from_timestamp(block_ts)
+            # Update voting epoch metric if it changed
+            voting_epoch_info.labels(voting_epoch_id=voting_epoch.id).set(1)
 
             if (
                 spb.signing_policy_initialized is not None
@@ -556,6 +612,15 @@ async def observer_loop(config: Configuration) -> None:
                 # TODO:(matej) this could fail if the observer is started during
                 # last two hours of the reward epoch
                 signing_policy = spb.build()
+                
+                # Update reward epoch metric if it changed
+                reward_epoch_info.labels(reward_epoch_id=signing_policy.reward_epoch.id).set(1)
+                
+                # Update entity metrics if target entity exists in signing policy
+                if tia in signing_policy.entity_mapper.by_identity_address:
+                    entity = signing_policy.entity_mapper.by_identity_address[tia]
+                    update_entity_metrics(entity)
+                
                 spb = SigningPolicy.builder().for_epoch(
                     signing_policy.reward_epoch.next
                 )

@@ -4,9 +4,9 @@
 
 # flare-observer
 
-deploy:
+## Deploy
 
-currently we support push notification over:
+Currently we support push notification over:
 - discord webhook
 - slack webhook
 - telegram bot sendMessage method
@@ -17,6 +17,7 @@ aren't a required value for the observer to start. All example values below
 
 ```bash
 docker run \
+    -p 8000:8000 \
     -e RPC_URL="http://host/ext/bc/C/rpc" \
     -e IDENTITY_ADDRESS="0x0000000000000000000000000000000000000000" \
     -e NOTIFICATION_DISCORD_WEBHOOK="https://discord.com/api/webhooks/secret/secret" \
@@ -27,7 +28,39 @@ docker run \
     ghcr.io/flare-foundation/fsp-observer:main
 ```
 
-todos:
+## Prometheus Metrics
+
+The observer exposes Prometheus metrics on port 8000. The following metrics are available:
+
+### General Metrics
+- `observer_info`: Observer information with labels `identity_address` and `chain_id`
+- `reward_epoch_info`: Current reward epoch information with label `reward_epoch_id`
+- `voting_epoch_info`: Current voting epoch information with label `voting_epoch_id`
+
+### Protocol Specific Metrics
+- `ftso_submit1_total`: Total FTSO submit1 transactions (counter)
+- `ftso_submit2_total`: Total FTSO submit2 transactions (counter)
+- `ftso_submit_signatures_total`: Total FTSO submit signatures transactions (counter)
+- `ftso_reveal_offence_total`: Total FTSO reveal offences (counter)
+- `ftso_none_values_total`: Total FTSO None values submitted (counter)
+- `ftso_signature_mismatch_total`: Total FTSO signature mismatches (counter)
+
+- `fdc_submit1_total`: Total FDC submit1 transactions (counter)
+- `fdc_submit2_total`: Total FDC submit2 transactions (counter)
+- `fdc_submit_signatures_total`: Total FDC submit signatures transactions (counter)
+- `fdc_reveal_offence_total`: Total FDC reveal offences (counter)
+- `fdc_signature_mismatch_total`: Total FDC signature mismatches (counter)
+
+### Message Level Metrics
+- `message_total`: Total messages by level (counter)
+
+### Entity Metrics
+- `entity_wnat_weight`: Entity WNAT weight (gauge)
+- `entity_wnat_capped_weight`: Entity WNAT capped weight (gauge)
+- `entity_registration_weight`: Entity registration weight (gauge)
+- `entity_normalized_weight`: Entity normalized weight (gauge)
+
+## Todos
 
 - more checks:
     - general/fsp:
