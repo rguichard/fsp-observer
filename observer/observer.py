@@ -238,14 +238,14 @@ def validate_ftso(round: VotingRound, entity: Entity, config: Configuration):
         _submit2, epoch.id, range(epoch.next.start_s, epoch.next.reveal_deadline())
     )
 
-    sig_deadline = max(
-        epoch.next.start_s + 55, (finalization and finalization.timestamp) or 0
+    sig_grace = max(
+        epoch.next.start_s + 55 + 1, (finalization and finalization.timestamp + 1) or 0
     )
     _submit_sig = ftso.submit_signatures.by_identity.get(entity.identity_address, [])
     submit_sig = extract(
         _submit_sig,
         epoch.id,
-        range(epoch.next.reveal_deadline(), sig_deadline),
+        range(epoch.next.reveal_deadline(), sig_grace),
     )
 
     # TODO:(matej) check for transactions that happened too late (or too early)
@@ -336,14 +336,19 @@ def validate_fdc(round: VotingRound, entity: Entity, config: Configuration):
         _submit2, epoch.id, range(epoch.next.start_s, epoch.next.reveal_deadline())
     )
 
-    sig_deadline = max(
-        epoch.next.start_s + 55, (finalization and finalization.timestamp) or 0
+    sig_grace = max(
+        epoch.next.start_s + 55 + 1, (finalization and finalization.timestamp + 1) or 0
     )
     _submit_sig = fdc.submit_signatures.by_identity.get(entity.identity_address, [])
     submit_sig = extract(
         _submit_sig,
         epoch.id,
-        range(epoch.next.reveal_deadline(), sig_deadline),
+        range(epoch.next.reveal_deadline(), sig_grace),
+    )
+    submit_sig_deadline = extract(
+        _submit_sig,
+        epoch.id,
+        range(epoch.next.reveal_deadline(), epoch.next.end_s),
     )
 
     # TODO:(matej) check for transactions that happened too late (or too early)
@@ -353,6 +358,7 @@ def validate_fdc(round: VotingRound, entity: Entity, config: Configuration):
     s1 = submit_1 is not None
     s2 = submit_2 is not None
     ss = submit_sig is not None
+    ssd = submit_sig_deadline is not None
 
     if not s1:
         # NOTE:(matej) this is expected behaviour in fdc
@@ -365,12 +371,23 @@ def validate_fdc(round: VotingRound, entity: Entity, config: Configuration):
         # TODO:(matej) analize request array and report unproven errors
         ...
 
-    if s2 and not ss:
+    if s2 and not ssd:
         # TODO:(matej) check if submit2 bitvote dominated consensus bitvote
         issues.append(
             mb.build(
                 MessageLevel.CRITICAL,
                 "no submit signatures transaction, causing reveal offence",
+            )
+        )
+
+    if s2 and ssd and not ss:
+        issues.append(
+            mb.build(
+                MessageLevel.CRITICAL,
+                (
+                    "no submit signatures transaction during grace period, "
+                    "causing loss of rewards"
+                ),
             )
         )
 
