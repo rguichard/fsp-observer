@@ -383,7 +383,7 @@ def validate_fdc(round: VotingRound, entity: Entity, config: Configuration):
     if s2 and ssd and not ss:
         issues.append(
             mb.build(
-                MessageLevel.CRITICAL,
+                MessageLevel.ERROR,
                 (
                     "no submit signatures transaction during grace period, "
                     "causing loss of rewards"

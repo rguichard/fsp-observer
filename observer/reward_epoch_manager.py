@@ -351,16 +351,10 @@ class VotingRoundManager:
                 self.rounds.pop(k, None)
                 continue
 
-            round = self.rounds[k]
-
-            ftso_finalized = round.ftso.finalization is not None
-            fdc_finalized = round.fdc.finalization is not None
-            both_finalized = fdc_finalized and ftso_finalized
-
             # need to wait until end of next epoch for fdc reveal offence condition
             round_completed = k.next.end_s < block["timestamp"]
 
-            if both_finalized or round_completed:
+            if round_completed:
                 self.finalized = max(self.finalized, k.id)
                 rounds.append(self.rounds.pop(k))
 
